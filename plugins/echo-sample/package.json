@@ -1,0 +1,13 @@
+{
+  "name": "commands-provider-echo-sample",
+  "version": "1.0.0",
+  "description": "Reference/sample LLM provider plugin for Commands Agent",
+  "type": "module",
+  "private": true,
+  "main": "index.mjs",
+  "commands": {
+    "providerId": "echo_sample",
+    "defaultModel": "echo-v1",
+    "desktopEntry": "desktop.mjs"
+  }
+}
