@@ -55,6 +55,22 @@ const desktopPlugin = {
 
     return { ok: true };
   },
+
+  // Keep the plugin self-contained: emit provider config env vars directly,
+  // and tighten heartbeat cadence so gateway presence does not flap.
+  buildEnv(config = {}, profile = {}) {
+    const styleRaw = normalizeString(config?.style, '').trim().toLowerCase();
+    const style = STYLES.has(styleRaw) ? styleRaw : 'echo';
+    const prefixRaw = normalizeString(config?.prefix, '[echo_sample] ');
+    const prefix = prefixRaw.length > 120 ? prefixRaw.slice(0, 120) : prefixRaw;
+
+    return {
+      PROVIDER_ECHO_SAMPLE_STYLE: style,
+      PROVIDER_ECHO_SAMPLE_PREFIX: prefix,
+      HEARTBEAT_MS: '15000',
+      MODEL: normalizeString(profile?.model, desktopPlugin.defaultModel),
+    };
+  },
 };
 
 export default desktopPlugin;

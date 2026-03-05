@@ -1,47 +1,61 @@
-# Getting Started (DMG/App Users)
+# Getting Started: Agent Provider Plugins (Desktop)
 
-This guide assumes you installed Commands Desktop from the DMG app.
+This guide is for Commands Desktop users (including DMG installs).
 
-## 1) Download plugin pack
+## 1. Get the repo
 
 ```bash
-# Option A: clone from GitHub
-git clone <REPO_URL>
-cd commands-com-agent-plugins
-
-# Option B: download ZIP from GitHub, extract, then:
-cd commands-com-agent-plugins
+git clone https://github.com/Commands-com/agent-plugins.git
+cd agent-plugins
 ```
 
-## 2) Install sample provider plugin
+## 2. Install plugins
 
 ```bash
 ./scripts/install-plugins.sh
 ```
 
-## 3) Enable plugin loading in Desktop
+This copies plugin folders to `~/.commands-agent/providers`.
 
-1. Open `Settings` -> `Developer`
-2. Turn `Dev Mode` on
-3. Turn `Trust All Plugins` on
+## 3. Enable plugin loading
+
+In Commands Desktop:
+
+1. Open `Settings -> Developer`
+2. Enable `Dev Mode`
+3. Enable `Trust All Plugins`
 4. Restart Desktop
 
-## 4) Verify provider appears
+## 4. Verify `echo_sample`
 
-In agent create/edit form, confirm provider:
+In agent create/edit:
 
-- `echo_sample`
+1. Choose provider `echo_sample`
+2. Set model `echo-v1`
+3. Set provider config:
+   - `style = uppercase`
+   - `prefix = [sample] `
+4. Send a test prompt and confirm transformed output
 
-## 5) Try the sample behavior
+## 5. Build your own provider
 
-Use provider config values:
+```bash
+cp -R ./plugins/echo-sample ./plugins/my-provider
+```
 
-- `style = uppercase`
-- `prefix = [sample] `
+Edit:
 
-Then run a prompt and confirm output is transformed.
+- `plugins/my-provider/package.json`
+- `plugins/my-provider/index.mjs`
+- `plugins/my-provider/desktop.mjs` (recommended)
 
-## 6) Optional CLI smoke test
+Reinstall:
+
+```bash
+./scripts/install-plugins.sh
+```
+
+## 6. Optional CLI smoke test
 
 ```bash
 export COMMANDS_AGENT_DEV=1
@@ -52,3 +66,8 @@ export PROVIDER_ECHO_SAMPLE_PREFIX='[cli] '
 
 commands-agent run --provider echo_sample --model echo-v1 --prompt "Hello sample plugin"
 ```
+
+## 7. Read the full contract before publishing
+
+- [`docs/CONTRACT.md`](./docs/CONTRACT.md)
+
