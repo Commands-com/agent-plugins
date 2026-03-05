@@ -56,8 +56,7 @@ const desktopPlugin = {
     return { ok: true };
   },
 
-  // Keep the plugin self-contained: emit provider config env vars directly,
-  // and tighten heartbeat cadence so gateway presence does not flap.
+  // Keep the plugin self-contained: emit provider-scoped config env vars.
   buildEnv(config = {}, profile = {}) {
     const styleRaw = normalizeString(config?.style, '').trim().toLowerCase();
     const style = STYLES.has(styleRaw) ? styleRaw : 'echo';
@@ -67,7 +66,6 @@ const desktopPlugin = {
     return {
       PROVIDER_ECHO_SAMPLE_STYLE: style,
       PROVIDER_ECHO_SAMPLE_PREFIX: prefix,
-      HEARTBEAT_MS: '15000',
       MODEL: normalizeString(profile?.model, desktopPlugin.defaultModel),
     };
   },

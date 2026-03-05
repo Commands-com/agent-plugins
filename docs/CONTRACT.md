@@ -164,9 +164,25 @@ If `desktopEntry` is missing, plugin is treated as agent-only (`hasDesktopModule
 
 Runtime provider config is built from env vars with this prefix:
 
-- `PROVIDER_<PROVIDER_ID_UPPER>_`
+- `PROVIDER_<NORMALIZED_ID>_`
 
-Example for `providerId=echo_sample`:
+The normalized ID is computed as:
+
+```
+providerId.toUpperCase().replace(/[^A-Z0-9]/g, '_')
+```
+
+All non-alphanumeric characters (e.g. hyphens) are replaced with underscores.
+
+Examples:
+
+| `providerId`    | Env prefix                   |
+| --------------- | ---------------------------- |
+| `echo_sample`   | `PROVIDER_ECHO_SAMPLE_`      |
+| `my-provider`   | `PROVIDER_MY_PROVIDER_`      |
+| `acme-llm`      | `PROVIDER_ACME_LLM_`         |
+
+For `providerId=echo_sample`:
 
 - `PROVIDER_ECHO_SAMPLE_STYLE=uppercase`
 - `PROVIDER_ECHO_SAMPLE_PREFIX=[sample] `
@@ -176,7 +192,7 @@ Then `runPrompt(input).providerConfig` receives:
 - `STYLE: "uppercase"`
 - `PREFIX: "[sample] "`
 
-If you implement `buildEnv`, prefer emitting `PROVIDER_<ID>_<KEY>` vars for settings your runtime module reads from `providerConfig`.
+If you implement `buildEnv`, prefer emitting `PROVIDER_<NORMALIZED_ID>_<KEY>` vars for settings your runtime module reads from `providerConfig`.
 
 ## 6. Loading Behavior and Security
 
