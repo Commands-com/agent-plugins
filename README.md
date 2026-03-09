@@ -1,18 +1,19 @@
 <div align="center">
 
-# Commands.com Agent Plugins (Sample)
+# Commands.com Agent Plugins
 
-**Build your own LLM provider plugin. Copy the sample, ship your own.**
+**Production provider plugins for Commands Desktop. OpenAI and Gemini out of the box.**
 
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933.svg)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
-[![Sample](https://img.shields.io/badge/Sample-echo__sample-blue.svg)](#included-sample)
+[![Providers](https://img.shields.io/badge/Providers-OpenAI%20%7C%20Gemini-blue.svg)](#included-plugins)
+[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#quick-start)
 
-Sample external provider plugins for Commands Desktop.
-Includes a reference implementation (`echo_sample`) with no external API dependencies.
+Distribution repo for provider plugins that connect Commands Desktop agents
+to external LLM APIs. Ships ready-to-install plugins with scripted setup.
 
 ```
-Commands Desktop  ──>  Provider Plugin (your code)  ──>  Any LLM API
+Commands Desktop  ──>  Provider Plugin  ──>  OpenAI / Gemini API
 ```
 
 </div>
@@ -23,49 +24,73 @@ Commands Desktop  ──>  Provider Plugin (your code)  ──>  Any LLM API
 
 | | |
 |---|---|
-| **Zero dependencies** | Sample plugin uses only Node.js built-ins, no API keys needed |
-| **Two-module pattern** | `index.mjs` for runtime logic, `desktop.mjs` for Desktop UI wiring |
-| **Deterministic** | Echo sample uses local text transforms — easy to test without credentials |
-| **Copy-and-go** | Clone `echo-sample`, update three files, reinstall |
-| **Full contract docs** | Complete specification for runtime and desktop module exports |
-| **Session support** | Built-in session management pattern for multi-turn conversations |
+| **Two providers** | OpenAI (`@openai/agents` SDK) and Gemini (CodeAssist API) ready to use |
+| **Cross-platform** | Bash installer for macOS/Linux, Node.js installer for Windows |
+| **Flexible auth** | API key via Desktop profile, or Codex / Gemini CLI OAuth tokens |
+| **MCP support** | OpenAI plugin supports stdio, HTTP, and SSE MCP servers |
+| **Streaming** | Real-time streaming responses with reasoning and thought support |
+| **Session management** | Multi-turn context with compaction and session persistence |
+| **Sample included** | `echo_sample` reference plugin — no API keys, easy to test |
 
 ## Requirements
 
 - Node.js 18+
-- Commands Desktop (DMG or dev build)
+- Commands Desktop (DMG, installer, or dev build)
 
 ## Quick Start
 
 ```bash
 git clone https://github.com/Commands-com/agent-plugins.git
 cd agent-plugins
+```
+
+**macOS / Linux:**
+
+```bash
 ./scripts/install-plugins.sh
 ```
 
-Installs to `~/.commands-agent/providers`.
+**Windows (or any platform with Node.js):**
+
+```bash
+node scripts/install-plugins.mjs
+```
+
+Both scripts copy plugins and install npm dependencies.
+
+| Platform | Default providers directory |
+|---|---|
+| macOS / Linux | `~/.commands-agent/providers` |
+| Windows | `%LOCALAPPDATA%\commands-agent\providers` |
 
 Then in Commands Desktop:
 
 1. Go to **Settings > Developer**.
 2. Enable **Dev Mode** and **Trust All Plugins**.
 3. Restart the app.
-4. Create or edit an agent profile and select provider `echo_sample`.
+4. Create or edit an agent profile and select provider `openai` or `gemini`.
 
-## Included Sample
+## Included Plugins
 
-### `echo_sample`
+### OpenAI
+
+- **Default model**: `gpt-5.4`
+- **SDK**: `@openai/agents`
+- **Auth**: Desktop profile `apiKey` field, or Codex OAuth token at `~/.codex/auth.json`
+- **Features**: file-system tools, MCP server support, session compaction
+
+### Gemini
+
+- **Default model**: `gemini-3.1-pro-preview`
+- **Available models**: `gemini-3.1-pro-preview`, `gemini-2.5-flash`, `gemini-2.0-flash`
+- **Auth**: Desktop profile `apiKey` field, or Gemini OAuth creds at `~/.gemini/oauth_creds.json`
+- **Features**: model fallback, retry with exponential backoff, thought signature injection
+
+### Echo Sample
 
 - **Models**: `echo-v1`, `echo-v2`
-- **Styles**: `echo` (passthrough), `uppercase`, `reverse`
-- **Config**: style dropdown, optional prefix text
 - **No external API calls** — deterministic local text transforms
-
-What it demonstrates:
-
-- Runtime provider contract (`index.mjs`) with `runPrompt()` implementation
-- Desktop provider module (`desktop.mjs`) with `configSchema`, `listModels()`, `validate()`, `buildEnv()`
-- Environment variable mapping (`PROVIDER_ECHO_SAMPLE_STYLE`, `PROVIDER_ECHO_SAMPLE_PREFIX`)
+- **Use as a template** for building your own provider
 
 ## Build Your Own Provider
 
@@ -82,18 +107,99 @@ Update:
 Reinstall:
 
 ```bash
-./scripts/install-plugins.sh
+./scripts/install-plugins.sh        # macOS/Linux
+node scripts/install-plugins.mjs    # Windows (or any platform)
 ```
 
 Restart Commands Desktop. Your provider appears in agent create/edit.
 
+## CLI / Runtime Usage
+
+External providers are only loaded when plugin verification is explicitly enabled.
+
+```bash
+COMMANDS_AGENT_DEV=1 \
+COMMANDS_AGENT_TRUST_ALL_PLUGINS=1 \
+node dist/index.js start
+```
+
+Optional custom plugin path:
+
+```bash
+COMMANDS_AGENT_PROVIDERS_DIR=/custom/providers/path
+```
+
+## Manual Install
+
+<details>
+<summary><strong>macOS / Linux</strong></summary>
+
+```bash
+mkdir -p ~/.commands-agent/providers
+
+rsync -a --delete ./plugins/openai/ ~/.commands-agent/providers/openai/
+rsync -a --delete ./plugins/gemini/ ~/.commands-agent/providers/gemini/
+
+npm install --prefix ~/.commands-agent/providers/openai --omit=dev
+npm install --prefix ~/.commands-agent/providers/gemini --omit=dev
+```
+
+</details>
+
+<details>
+<summary><strong>Windows (PowerShell)</strong></summary>
+
+```powershell
+$dest = "$env:LOCALAPPDATA\commands-agent\providers"
+New-Item -ItemType Directory -Force -Path "$dest\openai", "$dest\gemini"
+
+robocopy .\plugins\openai "$dest\openai" /MIR /XD node_modules
+robocopy .\plugins\gemini "$dest\gemini" /MIR /XD node_modules
+
+npm install --prefix "$dest\openai" --omit=dev
+npm install --prefix "$dest\gemini" --omit=dev
+```
+
+</details>
+
+## Updating
+
+```bash
+git pull
+./scripts/install-plugins.sh        # macOS/Linux
+node scripts/install-plugins.mjs    # Windows (or any platform)
+```
+
+## Uninstall
+
+<details>
+<summary><strong>macOS / Linux</strong></summary>
+
+```bash
+rm -rf ~/.commands-agent/providers/openai ~/.commands-agent/providers/gemini
+```
+
+</details>
+
+<details>
+<summary><strong>Windows (PowerShell)</strong></summary>
+
+```powershell
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-agent\providers\openai", "$env:LOCALAPPDATA\commands-agent\providers\gemini"
+```
+
+</details>
+
 ## Project Layout
 
 ```
-plugins/echo-sample         Reference provider (index.mjs, desktop.mjs)
-scripts/install-plugins.sh  Install plugins to ~/.commands-agent/providers
-docs/CONTRACT.md            Full provider contract specification
-GETTING_STARTED.md          Step-by-step setup and authoring workflow
+plugins/openai           OpenAI provider (index.mjs, desktop.js)
+plugins/gemini           Gemini provider (index.mjs, desktop.js)
+plugins/echo-sample      Reference provider (index.mjs, desktop.mjs)
+scripts/install-plugins.sh    Bash installer (macOS/Linux)
+scripts/install-plugins.mjs   Node.js installer (cross-platform)
+docs/CONTRACT.md         Full provider contract specification
+GETTING_STARTED.md       Step-by-step setup guide
 ```
 
 ## Additional Docs

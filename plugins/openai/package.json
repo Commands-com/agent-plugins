@@ -1,0 +1,15 @@
+{
+  "name": "commands-openai-provider",
+  "version": "0.1.0",
+  "type": "module",
+  "commands": {
+    "providerId": "openai",
+    "defaultModel": "gpt-5.4",
+    "desktopEntry": "desktop.js"
+  },
+  "dependencies": {
+    "@openai/agents": "^0.4.13",
+    "openai": "^6.22.0",
+    "zod": "^4.3.6"
+  }
+}

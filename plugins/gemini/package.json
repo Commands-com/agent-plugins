@@ -1,0 +1,13 @@
+{
+  "name": "commands-gemini-provider",
+  "version": "0.1.0",
+  "type": "module",
+  "commands": {
+    "providerId": "gemini",
+    "defaultModel": "gemini-3.1-pro-preview",
+    "desktopEntry": "desktop.js"
+  },
+  "dependencies": {
+    "google-auth-library": "^9.15.1"
+  }
+}

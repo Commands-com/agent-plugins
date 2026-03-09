@@ -1,73 +1,84 @@
-# Getting Started: Agent Provider Plugins (Desktop)
+# Getting Started
 
-This guide is for Commands Desktop users (including DMG installs).
+This guide gets you from a fresh desktop install to working provider plugins.
 
-## 1. Get the repo
+## 1. Download and install Commands Desktop
 
-```bash
-git clone https://github.com/Commands-com/agent-plugins.git
-cd agent-plugins
-```
+Use the app download link shared separately by the Commands team.
 
-## 2. Install plugins
+Install the app, then launch it once.
 
-```bash
-./scripts/install-plugins.sh
-```
-
-This copies plugin folders to `~/.commands-agent/providers`.
-
-## 3. Enable plugin loading
-
-In Commands Desktop:
-
-1. Open `Settings -> Developer`
-2. Enable `Dev Mode`
-3. Enable `Trust All Plugins`
-4. Restart Desktop
-
-## 4. Verify `echo_sample`
-
-In agent create/edit:
-
-1. Choose provider `echo_sample`
-2. Set model `echo-v1`
-3. Set provider config:
-   - `style = uppercase`
-   - `prefix = [sample] `
-4. Send a test prompt and confirm transformed output
-
-## 5. Build your own provider
+## 2. Install provider plugins
 
 ```bash
-cp -R ./plugins/echo-sample ./plugins/my-provider
+git clone https://github.com/dtannen/commands-com-agent-plugins.git
+cd commands-com-agent-plugins
 ```
 
-Edit:
-
-- `plugins/my-provider/package.json`
-- `plugins/my-provider/index.mjs`
-- `plugins/my-provider/desktop.mjs` (recommended)
-
-Reinstall:
+**macOS / Linux:**
 
 ```bash
 ./scripts/install-plugins.sh
 ```
 
-## 6. Optional CLI smoke test
+**Windows (or any platform with Node.js):**
 
 ```bash
-export COMMANDS_AGENT_DEV=1
-export COMMANDS_AGENT_TRUST_ALL_PLUGINS=1
-export COMMANDS_AGENT_PROVIDERS_DIR="$HOME/.commands-agent/providers"
-export PROVIDER_ECHO_SAMPLE_STYLE=reverse
-export PROVIDER_ECHO_SAMPLE_PREFIX='[cli] '
-
-commands-agent run --provider echo_sample --model echo-v1 --prompt "Hello sample plugin"
+node scripts/install-plugins.mjs
 ```
 
-## 7. Read the full contract before publishing
+What the script does:
+- Copies plugins into the providers directory (`~/.commands-agent/providers` on macOS/Linux, `%LOCALAPPDATA%\commands-agent\providers` on Windows)
+- Installs each plugin's production dependencies
 
-- [`docs/CONTRACT.md`](./docs/CONTRACT.md)
+## 3. Enable external plugins in Desktop
 
+In the app:
+1. Open `Settings`.
+2. Open `Developer`.
+3. Turn on `Dev Mode`.
+4. Turn on `Trust All Plugins`.
+5. Restart the app.
+
+## 4. Create or edit an agent profile
+
+Choose provider:
+- `openai`
+- `gemini`
+
+## 5. Configure credentials
+
+### OpenAI plugin
+
+Use either:
+- provider `apiKey` in profile settings, or
+- Codex OAuth at `~/.codex/auth.json` (run `codex` and sign in)
+
+### Gemini plugin
+
+Use either:
+- provider `apiKey` in profile settings, or
+- Gemini OAuth at `~/.gemini/oauth_creds.json` (run `gemini` and sign in)
+
+## 6. Update plugins later
+
+```bash
+cd commands-com-agent-plugins
+git pull
+./scripts/install-plugins.sh        # macOS/Linux
+node scripts/install-plugins.mjs    # Windows (or any platform)
+```
+
+## 7. Remove plugins
+
+**macOS / Linux:**
+
+```bash
+rm -rf ~/.commands-agent/providers/openai ~/.commands-agent/providers/gemini
+```
+
+**Windows (PowerShell):**
+
+```powershell
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-agent\providers\openai", "$env:LOCALAPPDATA\commands-agent\providers\gemini"
+```
