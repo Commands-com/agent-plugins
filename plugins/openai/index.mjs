@@ -11,18 +11,19 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import OpenAI from 'openai';
 import {
   Agent,
-  run,
+  Runner,
   tool,
-  setDefaultOpenAIClient,
   MCPServerStdio,
   MCPServerStreamableHttp,
   MCPServerSSE,
   connectMcpServers,
   createMCPToolStaticFilter,
+  OpenAIProvider,
 } from '@openai/agents';
 import { OpenAIResponsesCompactionSession } from '@openai/agents-openai';
 import { z } from 'zod';
@@ -42,6 +43,7 @@ const DEFAULT_TEXT_VERBOSITY = 'low';
 const ALLOWED_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh']);
 const ALLOWED_TEXT_VERBOSITIES = new Set(['low', 'medium', 'high']);
 const WRITE_ACCESS_SENTINEL = '__OPENAI_PROVIDER_WRITE_ACCESS_REQUEST__';
+const execFileAsync = promisify(execFile);
 
 const sessions = new Map();
 
@@ -159,6 +161,19 @@ function createCodexFetch({
   promptCacheKey,
   parallelToolCalls,
 }) {
+  function parseRequestJsonBody(body) {
+    if (typeof body === 'string') {
+      return JSON.parse(body);
+    }
+    if (body instanceof Uint8Array) {
+      return JSON.parse(Buffer.from(body).toString('utf8'));
+    }
+    if (body instanceof ArrayBuffer) {
+      return JSON.parse(Buffer.from(body).toString('utf8'));
+    }
+    return null;
+  }
+
   return async (url, init) => {
     // Only intercept /responses calls (the Agents SDK endpoint)
     if (typeof url === 'string' && !url.includes('/responses')) {
@@ -170,17 +185,18 @@ function createCodexFetch({
     // JSON directly.
     const isCompact = typeof url === 'string' && url.includes('/responses/compact');
 
-    if (typeof init?.body === 'string') {
+    if (init?.body != null) {
       try {
-        const b = JSON.parse(init.body);
+        const b = parseRequestJsonBody(init.body);
+        if (!b || typeof b !== 'object') {
+          throw new Error('request body is not JSON');
+        }
         if (isCompact) {
           // Compact endpoint requires `instructions`; SDK doesn't send it
           if (!b.instructions && instructions) {
             b.instructions = instructions;
           }
-          if (parallelToolCalls) {
-            b.parallel_tool_calls = true;
-          }
+          b.parallel_tool_calls = Boolean(parallelToolCalls);
           if (!b.reasoning || typeof b.reasoning !== 'object') {
             b.reasoning = { effort: reasoningEffort };
           } else if (!b.reasoning.effort) {
@@ -205,10 +221,8 @@ function createCodexFetch({
         } else {
           b.store = false;
           b.stream = true;
-          if (parallelToolCalls) {
-            b.parallel_tool_calls = true;
-          }
-          if (!b.prompt_cache_key && promptCacheKey) {
+          b.parallel_tool_calls = Boolean(parallelToolCalls);
+          if (promptCacheKey) {
             b.prompt_cache_key = promptCacheKey;
           }
           if (!b.reasoning || typeof b.reasoning !== 'object') {
@@ -236,6 +250,11 @@ function createCodexFetch({
               return item;
             });
           }
+        }
+        if (process.env.PROVIDER_OPENAI_FETCH_DEBUG === '1') {
+          process.stderr.write(
+            `[openai-provider fetch] ${isCompact ? 'compact' : 'responses'} cache=${promptCacheKey || '(none)'} parallel=${String(parallelToolCalls)} body_parallel=${String(b.parallel_tool_calls)}\n`,
+          );
         }
         init = { ...init, body: JSON.stringify(b) };
       } catch {
@@ -526,19 +545,196 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
     ? 'Path (relative to primary project root, or absolute path within any allowed directory)'
     : 'Relative path within the project';
   const isReadOnlyProfile = profile === 'read_only';
+  const MAX_LIST_LIMIT = 500;
+  const DEFAULT_LIST_LIMIT = 200;
+  const MAX_GLOB_LIMIT = 500;
+  const DEFAULT_GLOB_LIMIT = 200;
+  const MAX_LIST_DEPTH = 5;
+
+  function normalizePositiveInt(value, fallback, maxValue) {
+    const raw = typeof value === 'number' && Number.isFinite(value)
+      ? Math.trunc(value)
+      : fallback;
+    const normalized = raw > 0 ? raw : fallback;
+    return Math.min(normalized, maxValue);
+  }
+
+  function normalizeNonNegativeInt(value, fallback, maxValue = Number.MAX_SAFE_INTEGER) {
+    const raw = typeof value === 'number' && Number.isFinite(value)
+      ? Math.trunc(value)
+      : fallback;
+    const normalized = raw >= 0 ? raw : fallback;
+    return Math.min(normalized, maxValue);
+  }
+
+  function sortDirEntries(entries) {
+    return [...entries].sort((left, right) => {
+      if (left.isDirectory() !== right.isDirectory()) {
+        return left.isDirectory() ? -1 : 1;
+      }
+      return left.name.localeCompare(right.name);
+    });
+  }
+
+  function formatPaginatedLines(lines, offset, limit) {
+    if (lines.length === 0) {
+      return 'No entries found.';
+    }
+
+    const window = lines.slice(offset, offset + limit);
+    if (window.length === 0) {
+      return `No entries found in the requested window. Total entries: ${lines.length}.`;
+    }
+
+    const remaining = Math.max(lines.length - (offset + window.length), 0);
+    const suffix = remaining > 0
+      ? `\n... (${remaining} more entries; use offset=${offset + window.length} to continue)`
+      : '';
+    return window.join('\n') + suffix;
+  }
+
+  async function collectListEntries(baseDir, maxDepth, maxEntries) {
+    const lines = [];
+
+    async function walk(currentDir, remainingDepth) {
+      const entries = sortDirEntries(await fs.promises.readdir(currentDir, { withFileTypes: true }));
+      for (const entry of entries) {
+        const fullPath = path.join(currentDir, entry.name);
+        const relativePath = path.relative(baseDir, fullPath).split(path.sep).join('/');
+        lines.push(entry.isDirectory() ? `${relativePath}/` : relativePath);
+        if (lines.length >= maxEntries) {
+          return true;
+        }
+        if (entry.isDirectory() && remainingDepth > 1) {
+          const shouldStop = await walk(fullPath, remainingDepth - 1);
+          if (shouldStop) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    await walk(baseDir, maxDepth);
+    return lines;
+  }
+
+  function globPatternToRegExp(pattern) {
+    const normalized = String(pattern || '').split(path.sep).join('/');
+    const escaped = normalized
+      .replace(/[-[\]{}()+?.,\\^$|#\s]/g, '\\$&')
+      .replace(/\*\*/g, '__GLOBSTAR__')
+      .replace(/\*/g, '[^/]*')
+      .replace(/__GLOBSTAR__/g, '.*');
+    return new RegExp(`^${escaped}$`);
+  }
+
+  async function collectGlobMatches(baseDir, pattern, maxEntries) {
+    const matches = [];
+    const matcher = globPatternToRegExp(pattern);
+
+    async function walk(currentDir) {
+      const entries = sortDirEntries(await fs.promises.readdir(currentDir, { withFileTypes: true }));
+      for (const entry of entries) {
+        if (entry.isDirectory() && (entry.name === '.git' || entry.name === 'node_modules')) {
+          continue;
+        }
+        const fullPath = path.join(currentDir, entry.name);
+        if (entry.isDirectory()) {
+          const shouldStop = await walk(fullPath);
+          if (shouldStop) {
+            return true;
+          }
+          continue;
+        }
+
+        const relativePath = path.relative(baseDir, fullPath).split(path.sep).join('/');
+        if (matcher.test(relativePath)) {
+          matches.push(relativePath);
+          if (matches.length >= maxEntries) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    await walk(baseDir);
+    return matches;
+  }
 
   const listFiles = tool({
     name: 'list_files',
-    description: `List files and directories at a path. Returns names with / suffix for directories.${multiRoot ? ' Accepts absolute paths to any allowed directory.' : ''}`,
+    description: `List files and directories at a path. Supports pagination and shallow recursion. Returns names with / suffix for directories.${multiRoot ? ' Accepts absolute paths to any allowed directory.' : ''}`,
     parameters: z.object({
-      path: z.string().default('.').describe(pathDesc),
+      path: z.string().describe(`${pathDesc}. Use "." for the current directory.`),
+      depth: z.number().int().positive().nullable().describe('Recursion depth. Use 1 for direct children only, 2 to include one nested level, or null for the default depth of 1'),
+      offset: z.number().int().min(0).nullable().describe('Pagination offset. Use 0 or null for the first page'),
+      limit: z.number().int().positive().nullable().describe(`Maximum entries to return. Use null for the default limit of ${DEFAULT_LIST_LIMIT}`),
     }),
-    execute: async ({ path: relPath }) => {
-      const target = safePath(relPath);
-      const entries = fs.readdirSync(target, { withFileTypes: true });
-      return entries
-        .map(e => e.isDirectory() ? e.name + '/' : e.name)
-        .join('\n');
+    execute: async ({ path: relPath, depth, offset, limit }) => {
+      const target = safePath(relPath || '.');
+      const stat = await fs.promises.stat(target);
+      if (!stat.isDirectory()) {
+        return `Path is not a directory: ${relPath}`;
+      }
+
+      const depthLimit = normalizePositiveInt(depth, 1, MAX_LIST_DEPTH);
+      const paginationOffset = normalizeNonNegativeInt(offset, 0);
+      const paginationLimit = normalizePositiveInt(limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+      const lines = await collectListEntries(
+        target,
+        depthLimit,
+        paginationOffset + paginationLimit + 1,
+      );
+      return formatPaginatedLines(lines, paginationOffset, paginationLimit);
+    },
+  });
+
+  const globFiles = tool({
+    name: 'glob',
+    description: `Find files by filename/path pattern without reading file contents. Prefer this for discovery before broad content searches.${multiRoot ? ' Accepts absolute paths to any allowed directory.' : ''}`,
+    parameters: z.object({
+      path: z.string().describe(`${pathDesc}. Use "." for the current directory.`),
+      pattern: z.string().describe('Glob pattern such as "*.json", "src/**/*.ts", or "**/*test*.js"'),
+      offset: z.number().int().min(0).nullable().describe('Pagination offset. Use 0 or null for the first page'),
+      limit: z.number().int().positive().nullable().describe(`Maximum matches to return. Use null for the default limit of ${DEFAULT_GLOB_LIMIT}`),
+    }),
+    execute: async ({ path: relPath, pattern, offset, limit }) => {
+      const target = safePath(relPath || '.');
+      const stat = await fs.promises.stat(target);
+      if (!stat.isDirectory()) {
+        return `Path is not a directory: ${relPath}`;
+      }
+
+      const paginationOffset = normalizeNonNegativeInt(offset, 0);
+      const paginationLimit = normalizePositiveInt(limit, DEFAULT_GLOB_LIMIT, MAX_GLOB_LIMIT);
+      let lines = [];
+
+      if (process.platform !== 'win32') {
+        try {
+          const { stdout } = await execFileAsync(
+            'rg',
+            ['--files', '-g', pattern, '.'],
+            { cwd: target, encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10000 },
+          );
+          lines = stdout.split('\n').filter(Boolean);
+        } catch (err) {
+          if (err.code !== 'ENOENT' && err.code !== 1 && err.status !== 1) {
+            return `Glob error: ${err.message}`;
+          }
+        }
+      }
+
+      if (lines.length === 0) {
+        try {
+          lines = await collectGlobMatches(target, pattern, paginationOffset + paginationLimit + 1);
+        } catch (err) {
+          return `Glob error: ${err.message}`;
+        }
+      }
+
+      return formatPaginatedLines(lines, paginationOffset, paginationLimit);
     },
   });
 
@@ -547,12 +743,12 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
     description: `Read the contents of a file. Optionally limit to a line range to reduce context use.${multiRoot ? ' Accepts absolute paths to any allowed directory.' : ''}`,
     parameters: z.object({
       path: z.string().describe(pathDesc),
-      start_line: z.number().int().positive().optional().describe('Optional 1-based starting line'),
-      end_line: z.number().int().positive().optional().describe('Optional 1-based ending line (inclusive)'),
+      start_line: z.number().int().positive().nullable().describe('1-based starting line, or null to read from the beginning'),
+      end_line: z.number().int().positive().nullable().describe('1-based ending line (inclusive), or null to read through the end of the file'),
     }),
     execute: async ({ path: relPath, start_line: startLine, end_line: endLine }) => {
       const target = safePath(relPath);
-      const content = fs.readFileSync(target, 'utf8');
+      const content = await fs.promises.readFile(target, 'utf8');
       if (startLine == null && endLine == null) {
         return content;
       }
@@ -580,8 +776,8 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
     }),
     execute: async ({ path: relPath, content }) => {
       const target = safePath(relPath);
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, content);
+      await fs.promises.mkdir(path.dirname(target), { recursive: true });
+      await fs.promises.writeFile(target, content);
       return `Wrote ${content.length} bytes to ${relPath}`;
     },
   });
@@ -593,7 +789,7 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
       path: z.string().describe(pathDesc),
       old_string: z.string().describe('Exact literal text to replace'),
       new_string: z.string().describe('Replacement text'),
-      allow_multiple: z.boolean().default(false).describe('Replace all matches when true'),
+      allow_multiple: z.boolean().nullable().describe('Set true to replace all matches, or false/null to replace only the first match'),
     }),
     execute: async ({ path: relPath, old_string: oldString, new_string: newString, allow_multiple: allowMultiple }) => {
       if (!oldString) {
@@ -601,19 +797,20 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
       }
 
       const target = safePath(relPath);
-      const content = fs.readFileSync(target, 'utf8');
+      const content = await fs.promises.readFile(target, 'utf8');
       const count = content.split(oldString).length - 1;
       if (count === 0) {
         return `Error: old_string not found in ${relPath}.`;
       }
-      if (count > 1 && !allowMultiple) {
+      const shouldReplaceAll = allowMultiple === true;
+      if (count > 1 && !shouldReplaceAll) {
         return `Error: old_string found ${count} times in ${relPath}. Set allow_multiple to true to replace all.`;
       }
 
-      const nextContent = allowMultiple
+      const nextContent = shouldReplaceAll
         ? content.replaceAll(oldString, newString)
         : content.replace(oldString, newString);
-      fs.writeFileSync(target, nextContent);
+      await fs.promises.writeFile(target, nextContent);
       return `Replaced ${count} occurrence(s) in ${relPath}`;
     },
   });
@@ -623,9 +820,10 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
     description: `Search for a text pattern (regex) across files. Returns matching file paths and line numbers.${multiRoot ? ' Searches all allowed directories.' : ''}`,
     parameters: z.object({
       pattern: z.string().describe('Regex pattern to search for'),
-      glob: z.string().default('*').describe('File glob pattern to filter (e.g. "*.js", "**/*.ts")'),
+      glob: z.string().describe('File glob pattern to filter (e.g. "*.js", "**/*.ts"). Use "*" to search all files.'),
     }),
     execute: async ({ pattern, glob: globPattern }) => {
+      const normalizedGlob = globPattern || '*';
       const allResults = [];
 
       if (process.platform === 'win32') {
@@ -633,7 +831,7 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
         let re;
         try { re = new RegExp(pattern); } catch { return `Invalid regex pattern: ${pattern}`; }
         const globRe = new RegExp(
-          '^' + globPattern.replace(/\./g, '\\.').replace(/\*\*/g, '{{GLOBSTAR}}').replace(/\*/g, '[^/]*').replace(/\?/g, '.').replace(/\{\{GLOBSTAR\}\}/g, '.*') + '$'
+          '^' + normalizedGlob.replace(/\./g, '\\.').replace(/\*\*/g, '{{GLOBSTAR}}').replace(/\*/g, '[^/]*').replace(/\?/g, '.').replace(/\{\{GLOBSTAR\}\}/g, '.*') + '$'
         );
         function walkDir(dir, root) {
           let entries;
@@ -668,25 +866,29 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
         for (const root of allowedRoots) {
           try {
             const rgArgs = ['--line-number', '--no-heading', '--color', 'never'];
-            if (globPattern && globPattern !== '*') {
-              rgArgs.push('--glob', globPattern);
+            if (normalizedGlob && normalizedGlob !== '*') {
+              rgArgs.push('--glob', normalizedGlob);
             }
             rgArgs.push(pattern, '.');
 
             let result;
             try {
-              result = execFileSync(
+              const execResult = await execFileAsync(
                 'rg',
                 rgArgs,
                 { cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10000 },
               );
+              result = execResult.stdout;
             } catch (err) {
               if (err.code === 'ENOENT') {
-                result = execFileSync(
+                const execResult = await execFileAsync(
                   'grep',
-                  ['-rn', `--include=${globPattern}`, pattern, '.'],
+                  ['-rn', `--include=${normalizedGlob}`, pattern, '.'],
                   { cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10000 },
                 );
+                result = execResult.stdout;
+              } else if (err.code === 1) {
+                result = '';
               } else {
                 throw err;
               }
@@ -848,17 +1050,17 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
         }
         // Validate that file-reading commands cannot access paths outside allowed roots
         validatePathArgs(program, args);
-        const result = execFileSync(program, args, {
+        const { stdout } = await execFileAsync(program, args, {
           cwd: projectDir,
           encoding: 'utf8',
           maxBuffer: 1024 * 1024,
           timeout: 30000,
         });
-        const lines = result.split('\n');
+        const lines = stdout.split('\n');
         if (lines.length > 100) {
           return lines.slice(0, 100).join('\n') + '\n... (truncated)';
         }
-        return result || '(no output)';
+        return stdout || '(no output)';
       } catch (err) {
         if (err.message && err.message.includes('escapes allowed directories')) {
           return `Command rejected: ${err.message}`;
@@ -877,7 +1079,7 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
     execute: async ({ reason }) => `${WRITE_ACCESS_SENTINEL}\n${String(reason || '').trim()}`,
   });
 
-  const tools = [listFiles, readFile];
+  const tools = [listFiles, globFiles, readFile];
 
   const writeIsDisallowed = hasAnyDisallowedTool(policy, [
     'Write',
@@ -929,10 +1131,10 @@ function buildDefaultPrompt({
     : `You are a coding assistant with access to a project directory at: ${projectDir}`;
 
   if (profile === 'read_only') {
-    return `${dirIntro}\n\nYou are operating in read-only review mode. You can list files, read files, read targeted line ranges, search for patterns, and run read-only shell commands.\nAlways explore the project structure before making changes.\nPrefer targeted reads to keep context small.${parallelToolCalls ? '\nBatch independent read-only tool calls in parallel when helpful.' : ''}\nDo not attempt edits in this mode.${canEscalateToWrite ? '\nIf the task truly requires edits or broader shell access, call request_write_access with a brief reason. The system will rerun with write-capable tools and any additional shell access permitted by policy.' : ''}\nKeep responses concise and focused on the task.`;
+    return `${dirIntro}\n\nYou are operating in read-only review mode. You can list files, glob for candidate filenames, read files, read targeted line ranges, search for patterns, and run read-only shell commands.\nAlways explore the project structure before making changes.\nPrefer filename discovery with glob, then shallow/paginated list_files, then targeted read_file line ranges before broad searches.\nUse search_files only when you need content matches instead of filename discovery.${parallelToolCalls ? '\nBatch independent read-only tool calls in parallel when helpful.' : ''}\nDo not attempt edits in this mode.${canEscalateToWrite ? '\nIf the task truly requires edits or broader shell access, call request_write_access with a brief reason. The system will rerun with write-capable tools and any additional shell access permitted by policy.' : ''}\nKeep responses concise and focused on the task.`;
   }
 
-  return `${dirIntro}\n\nYou can list files, read files, read targeted line ranges, replace exact text within files, write files, search for patterns, and run shell commands.\nAlways explore the project structure before making changes.\nPrefer targeted reads and exact replacements for small edits.\nKeep responses concise and focused on the task.`;
+  return `${dirIntro}\n\nYou can list files, glob for candidate filenames, read files, read targeted line ranges, replace exact text within files, write files, search for patterns, and run shell commands.\nAlways explore the project structure before making changes.\nPrefer filename discovery with glob, shallow/paginated list_files, targeted reads, and exact replacements for small edits.\nKeep responses concise and focused on the task.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,7 +1214,12 @@ const openaiProvider = {
           parallelToolCalls,
         }),
       });
-      setDefaultOpenAIClient(client);
+      const runner = new Runner({
+        modelProvider: new OpenAIProvider({
+          openAIClient: client,
+          useResponses: true,
+        }),
+      });
 
       const mcpSession = enableMcp
         ? await connectPolicyMcpServers(input.mcpServers, input.policy)
@@ -1035,7 +1242,7 @@ const openaiProvider = {
 
         const agent = new Agent(agentConfig);
         const { session, id: sessionId } = getOrCreateSession(requestedSessionId, client, model, sessionProfile);
-        const result = await run(agent, prompt, { maxTurns, session });
+        const result = await runner.run(agent, prompt, { maxTurns, session });
         return { result, sessionId };
       } finally {
         if (mcpSession) {
