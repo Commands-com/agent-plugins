@@ -23,6 +23,7 @@ Scenarios:
   basic             Validate the initial request envelope and return a final message
   tool-call         Return a read-only function call, then verify the provider continues the turn
   multi-read        Return two read-only function calls in one response and verify both outputs come back together
+  review-tools      Walk a git-native review flow through changed files and paged diff reads
   write-escalation  Return request_write_access, then verify the provider reruns with full tools
 `);
 }
@@ -56,7 +57,7 @@ for (let i = 0; i < args.length; i += 1) {
   }
 }
 
-const SUPPORTED_SCENARIOS = new Set(['basic', 'tool-call', 'multi-read', 'write-escalation']);
+const SUPPORTED_SCENARIOS = new Set(['basic', 'tool-call', 'multi-read', 'review-tools', 'write-escalation']);
 if (!SUPPORTED_SCENARIOS.has(scenario)) {
   console.error(`Unsupported scenario: ${scenario}`);
   usage();
@@ -288,6 +289,47 @@ const server = http.createServer(async (req, res) => {
         makeMessageItem('multi-read scenario received an unexpected follow-up request'),
       ]);
     }
+  } else if (scenario === 'review-tools') {
+    if (responseCount === 1) {
+      completed = makeCompletedResponse(body, [
+        makeFunctionCallItem({
+          id: 'fc_list_changed_files_1',
+          callId: 'call_list_changed_files_1',
+          name: 'list_changed_files',
+          args: {
+            scope: 'commit',
+            target: 'HEAD',
+            path: null,
+            offset: 0,
+            limit: 10,
+          },
+        }),
+      ]);
+    } else if (hasFunctionCallOutput(body, 'call_read_diff_1')) {
+      completed = makeCompletedResponse(body, [
+        makeMessageItem('review-tools ok'),
+      ]);
+    } else if (hasFunctionCallOutput(body, 'call_list_changed_files_1')) {
+      completed = makeCompletedResponse(body, [
+        makeFunctionCallItem({
+          id: 'fc_read_diff_1',
+          callId: 'call_read_diff_1',
+          name: 'read_diff',
+          args: {
+            scope: 'commit',
+            target: 'HEAD',
+            path: 'plugins/openai/index.mjs',
+            context_lines: 5,
+            offset: 0,
+            limit: 120,
+          },
+        }),
+      ]);
+    } else {
+      completed = makeCompletedResponse(body, [
+        makeMessageItem('review-tools scenario received an unexpected follow-up request'),
+      ]);
+    }
   } else if (scenario === 'write-escalation') {
     if (responseCount === 1) {
       completed = makeCompletedResponse(body, [
@@ -344,7 +386,7 @@ try {
       READ_ONLY_FIRST: 'true',
       PARALLEL_TOOL_CALLS: 'true',
     },
-    maxTurns: 3,
+    maxTurns: 5,
   });
 } catch (error) {
   runError = error;
@@ -407,6 +449,18 @@ if (!getToolNames(firstResponse.body).includes('glob')) {
   console.error('Expected the glob tool to be exposed in the first /responses request.');
   process.exit(12);
 }
+if (!getToolNames(firstResponse.body).includes('list_changed_files')) {
+  console.error('Expected the list_changed_files tool to be exposed in the first /responses request.');
+  process.exit(13);
+}
+if (!getToolNames(firstResponse.body).includes('read_diff')) {
+  console.error('Expected the read_diff tool to be exposed in the first /responses request.');
+  process.exit(14);
+}
+if (!getToolNames(firstResponse.body).includes('read_file_at_revision')) {
+  console.error('Expected the read_file_at_revision tool to be exposed in the first /responses request.');
+  process.exit(15);
+}
 
 if (scenario === 'tool-call') {
   if (responseRequests.length !== 2) {
@@ -451,6 +505,21 @@ if (scenario === 'write-escalation') {
   if (responseRequests[1].body.parallel_tool_calls === true) {
     console.error('Write escalation follow-up incorrectly kept parallel_tool_calls=true.');
     process.exit(7);
+  }
+}
+
+if (scenario === 'review-tools') {
+  if (responseRequests.length !== 3) {
+    console.error(`Expected 3 /responses requests for review-tools scenario, saw ${responseRequests.length}.`);
+    process.exit(16);
+  }
+  if (!hasFunctionCallOutput(responseRequests[1].body, 'call_list_changed_files_1')) {
+    console.error('Did not observe the expected function_call_output for list_changed_files.');
+    process.exit(17);
+  }
+  if (!hasFunctionCallOutput(responseRequests[2].body, 'call_read_diff_1')) {
+    console.error('Did not observe the expected function_call_output for read_diff.');
+    process.exit(18);
   }
 }
 

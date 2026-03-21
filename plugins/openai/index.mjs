@@ -550,6 +550,13 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
   const MAX_GLOB_LIMIT = 500;
   const DEFAULT_GLOB_LIMIT = 200;
   const MAX_LIST_DEPTH = 5;
+  const DEFAULT_CHANGED_FILES_LIMIT = 200;
+  const MAX_CHANGED_FILES_LIMIT = 500;
+  const DEFAULT_DIFF_LINE_LIMIT = 400;
+  const MAX_DIFF_LINE_LIMIT = 1200;
+  const MAX_GIT_OUTPUT_BUFFER = 4 * 1024 * 1024;
+  const reviewScopeSchema = z.enum(['uncommitted', 'commit', 'range']);
+  let gitRepoRootPromise;
 
   function normalizePositiveInt(value, fallback, maxValue) {
     const raw = typeof value === 'number' && Number.isFinite(value)
@@ -661,6 +668,208 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
 
     await walk(baseDir);
     return matches;
+  }
+
+  async function getGitRepoRoot() {
+    if (!gitRepoRootPromise) {
+      gitRepoRootPromise = (async () => {
+        try {
+          const { stdout } = await execFileAsync('git', ['rev-parse', '--show-toplevel'], {
+            cwd: projectDir,
+            encoding: 'utf8',
+            maxBuffer: 1024 * 1024,
+            timeout: 10000,
+          });
+          const gitRoot = stdout.trim();
+          return gitRoot ? gitRoot : null;
+        } catch {
+          return null;
+        }
+      })();
+    }
+    return gitRepoRootPromise;
+  }
+
+  async function runGit(args, { allowExitCode1 = false } = {}) {
+    const gitRoot = await getGitRepoRoot();
+    if (!gitRoot) {
+      return {
+        ok: false,
+        message: 'Current project is not inside a git repository.',
+      };
+    }
+
+    try {
+      const { stdout, stderr } = await execFileAsync('git', args, {
+        cwd: gitRoot,
+        encoding: 'utf8',
+        maxBuffer: MAX_GIT_OUTPUT_BUFFER,
+        timeout: 30000,
+      });
+      return { ok: true, stdout, stderr, gitRoot };
+    } catch (err) {
+      if (allowExitCode1 && (err.code === 1 || err.status === 1)) {
+        return {
+          ok: true,
+          stdout: err.stdout || '',
+          stderr: err.stderr || '',
+          gitRoot,
+        };
+      }
+      const stderr = typeof err.stderr === 'string' ? err.stderr.trim() : '';
+      const message = stderr || err.message || String(err);
+      return {
+        ok: false,
+        message: `Git command failed: ${message}`,
+      };
+    }
+  }
+
+  function normalizeNullableString(value) {
+    const trimmed = String(value || '').trim();
+    return trimmed ? trimmed : null;
+  }
+
+  function formatPaginatedText(content, offset, limit) {
+    const lines = String(content || '').replace(/\r\n/g, '\n').split('\n');
+    if (lines.length > 0 && lines[lines.length - 1] === '') {
+      lines.pop();
+    }
+    if (lines.length === 0) {
+      return 'No output found.';
+    }
+
+    const window = lines.slice(offset, offset + limit);
+    if (window.length === 0) {
+      return `No lines found in the requested window. Total lines: ${lines.length}.`;
+    }
+
+    const numbered = window.map((line, idx) => `${offset + idx + 1}\t${line}`);
+    const remaining = Math.max(lines.length - (offset + window.length), 0);
+    const suffix = remaining > 0
+      ? `\n... (${remaining} more lines; use offset=${offset + window.length} to continue)`
+      : '';
+    return numbered.join('\n') + suffix;
+  }
+
+  async function resolveGitPathspec(relPath) {
+    const normalizedPath = normalizeNullableString(relPath);
+    if (!normalizedPath) {
+      return { ok: true, pathspec: null };
+    }
+
+    const gitRoot = await getGitRepoRoot();
+    if (!gitRoot) {
+      return {
+        ok: false,
+        message: 'Current project is not inside a git repository.',
+      };
+    }
+
+    let absolutePath;
+    try {
+      absolutePath = safePath(normalizedPath);
+    } catch (err) {
+      return {
+        ok: false,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+
+    const relativePath = path.relative(gitRoot, absolutePath).split(path.sep).join('/');
+    if (relativePath === '') {
+      return { ok: true, pathspec: '.' };
+    }
+    if (relativePath === '..' || relativePath.startsWith('../')) {
+      return {
+        ok: false,
+        message: `Path is outside the primary git repository: ${normalizedPath}`,
+      };
+    }
+
+    return { ok: true, pathspec: relativePath };
+  }
+
+  async function prepareReviewScope(scope, target, relPath) {
+    const normalizedTarget = normalizeNullableString(target);
+    if (scope !== 'uncommitted' && !normalizedTarget) {
+      return {
+        ok: false,
+        message: `target is required when scope="${scope}".`,
+      };
+    }
+
+    const pathspecResult = await resolveGitPathspec(relPath);
+    if (!pathspecResult.ok) {
+      return pathspecResult;
+    }
+
+    return {
+      ok: true,
+      target: normalizedTarget,
+      pathspec: pathspecResult.pathspec,
+    };
+  }
+
+  function buildGitPathspecArgs(pathspec) {
+    return pathspec ? ['--', pathspec] : [];
+  }
+
+  async function getUncommittedStatus(pathspec) {
+    return runGit([
+      'status',
+      '--short',
+      '--untracked-files=all',
+      '--ignored=no',
+      '--porcelain=v1',
+      ...buildGitPathspecArgs(pathspec),
+    ]);
+  }
+
+  async function buildUncommittedDiff(pathspec, contextLines) {
+    const sections = [];
+    const staged = await runGit([
+      'diff',
+      '--cached',
+      '--no-ext-diff',
+      `--unified=${contextLines}`,
+      ...buildGitPathspecArgs(pathspec),
+    ]);
+    if (!staged.ok) {
+      return staged;
+    }
+    if (staged.stdout.trim()) {
+      sections.push(`## Staged changes\n\n${staged.stdout.trimEnd()}`);
+    }
+
+    const unstaged = await runGit([
+      'diff',
+      '--no-ext-diff',
+      `--unified=${contextLines}`,
+      ...buildGitPathspecArgs(pathspec),
+    ]);
+    if (!unstaged.ok) {
+      return unstaged;
+    }
+    if (unstaged.stdout.trim()) {
+      sections.push(`## Unstaged changes\n\n${unstaged.stdout.trimEnd()}`);
+    }
+
+    const status = await getUncommittedStatus(pathspec);
+    if (!status.ok) {
+      return status;
+    }
+    const untracked = status.stdout
+      .split('\n')
+      .filter((line) => line.startsWith('?? '));
+    if (untracked.length > 0) {
+      sections.push(`## Untracked files\n\n${untracked.join('\n')}`);
+    }
+
+    return {
+      ok: true,
+      stdout: sections.join('\n\n'),
+    };
   }
 
   const listFiles = tool({
@@ -916,6 +1125,168 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
     },
   });
 
+  const listChangedFiles = tool({
+    name: 'list_changed_files',
+    description: 'List files changed in a review target. Prefer this first for reviews and audits before broad filesystem exploration.',
+    parameters: z.object({
+      scope: reviewScopeSchema.describe('Review scope: "uncommitted" for current workspace changes, "commit" for one commit, or "range" for a git diff range'),
+      target: z.string().nullable().describe('Use null for scope="uncommitted". For scope="commit", provide a commit SHA like "abc123". For scope="range", provide a diff range like "main...HEAD"'),
+      path: z.string().nullable().describe('Optional file or directory path filter within the primary git repository, or null for the whole review target'),
+      offset: z.number().int().min(0).nullable().describe('Pagination offset. Use 0 or null for the first page'),
+      limit: z.number().int().positive().nullable().describe(`Maximum changed files to return. Use null for the default limit of ${DEFAULT_CHANGED_FILES_LIMIT}`),
+    }),
+    execute: async ({ scope, target, path: relPath, offset, limit }) => {
+      const prepared = await prepareReviewScope(scope, target, relPath);
+      if (!prepared.ok) {
+        return prepared.message;
+      }
+
+      const paginationOffset = normalizeNonNegativeInt(offset, 0);
+      const paginationLimit = normalizePositiveInt(limit, DEFAULT_CHANGED_FILES_LIMIT, MAX_CHANGED_FILES_LIMIT);
+      let lines = [];
+
+      if (scope === 'uncommitted') {
+        const status = await getUncommittedStatus(prepared.pathspec);
+        if (!status.ok) {
+          return status.message;
+        }
+        lines = status.stdout.split('\n').filter(Boolean);
+      } else if (scope === 'commit') {
+        const result = await runGit([
+          'show',
+          '--format=',
+          '--name-status',
+          '--find-renames',
+          prepared.target,
+          ...buildGitPathspecArgs(prepared.pathspec),
+        ]);
+        if (!result.ok) {
+          return result.message;
+        }
+        lines = result.stdout.split('\n').filter(Boolean);
+      } else {
+        const result = await runGit([
+          'diff',
+          '--name-status',
+          '--find-renames',
+          prepared.target,
+          ...buildGitPathspecArgs(prepared.pathspec),
+        ]);
+        if (!result.ok) {
+          return result.message;
+        }
+        lines = result.stdout.split('\n').filter(Boolean);
+      }
+
+      if (lines.length === 0) {
+        return 'No changed files found.';
+      }
+      return formatPaginatedLines(lines, paginationOffset, paginationLimit);
+    },
+  });
+
+  const readDiff = tool({
+    name: 'read_diff',
+    description: 'Read a paginated git diff for a review target. Prefer this before broad file reads when reviewing code changes.',
+    parameters: z.object({
+      scope: reviewScopeSchema.describe('Review scope: "uncommitted" for current workspace changes, "commit" for one commit, or "range" for a git diff range'),
+      target: z.string().nullable().describe('Use null for scope="uncommitted". For scope="commit", provide a commit SHA like "abc123". For scope="range", provide a diff range like "main...HEAD"'),
+      path: z.string().nullable().describe('Optional file or directory path filter within the primary git repository, or null for the whole review target'),
+      context_lines: z.number().int().positive().nullable().describe('How many unchanged context lines to include around each hunk. Use null for the default of 5'),
+      offset: z.number().int().min(0).nullable().describe('Starting diff line offset. Use 0 or null for the first page'),
+      limit: z.number().int().positive().nullable().describe(`Maximum diff lines to return. Use null for the default limit of ${DEFAULT_DIFF_LINE_LIMIT}`),
+    }),
+    execute: async ({ scope, target, path: relPath, context_lines: contextLines, offset, limit }) => {
+      const prepared = await prepareReviewScope(scope, target, relPath);
+      if (!prepared.ok) {
+        return prepared.message;
+      }
+
+      const requestedContextLines = normalizePositiveInt(contextLines, 5, 20);
+      const paginationOffset = normalizeNonNegativeInt(offset, 0);
+      const paginationLimit = normalizePositiveInt(limit, DEFAULT_DIFF_LINE_LIMIT, MAX_DIFF_LINE_LIMIT);
+      let diffResult;
+
+      if (scope === 'uncommitted') {
+        diffResult = await buildUncommittedDiff(prepared.pathspec, requestedContextLines);
+      } else if (scope === 'commit') {
+        diffResult = await runGit([
+          'show',
+          '--format=medium',
+          '--find-renames',
+          '--no-ext-diff',
+          `--unified=${requestedContextLines}`,
+          prepared.target,
+          ...buildGitPathspecArgs(prepared.pathspec),
+        ]);
+      } else {
+        diffResult = await runGit([
+          'diff',
+          '--find-renames',
+          '--no-ext-diff',
+          `--unified=${requestedContextLines}`,
+          prepared.target,
+          ...buildGitPathspecArgs(prepared.pathspec),
+        ]);
+      }
+
+      if (!diffResult.ok) {
+        return diffResult.message;
+      }
+      if (!diffResult.stdout.trim()) {
+        return 'No diff found.';
+      }
+      return formatPaginatedText(diffResult.stdout, paginationOffset, paginationLimit);
+    },
+  });
+
+  const readFileAtRevision = tool({
+    name: 'read_file_at_revision',
+    description: 'Read a file exactly as it existed at a git revision. Useful for review follow-up when you need the pre-change or historical version of a file.',
+    parameters: z.object({
+      path: z.string().describe('Path to a file within the primary git repository'),
+      revision: z.string().describe('Git revision expression such as "HEAD", "abc123", or "abc123^"'),
+      start_line: z.number().int().positive().nullable().describe('1-based starting line, or null to read from the beginning'),
+      end_line: z.number().int().positive().nullable().describe('1-based ending line (inclusive), or null to read through the end of the file'),
+    }),
+    execute: async ({ path: relPath, revision, start_line: startLine, end_line: endLine }) => {
+      const normalizedRevision = normalizeNullableString(revision);
+      if (!normalizedRevision) {
+        return 'revision is required.';
+      }
+
+      const pathspecResult = await resolveGitPathspec(relPath);
+      if (!pathspecResult.ok) {
+        return pathspecResult.message;
+      }
+      if (!pathspecResult.pathspec || pathspecResult.pathspec === '.') {
+        return 'Path must point to a file within the primary git repository.';
+      }
+
+      const result = await runGit(['show', `${normalizedRevision}:${pathspecResult.pathspec}`]);
+      if (!result.ok) {
+        return result.message;
+      }
+
+      const content = result.stdout;
+      if (startLine == null && endLine == null) {
+        return content;
+      }
+
+      const lines = content.split('\n');
+      const start = Math.max(startLine || 1, 1);
+      const end = Math.max(endLine || start, start);
+      if (start > lines.length) {
+        return `Requested range ${start}-${end} is outside the file (length ${lines.length} lines).`;
+      }
+
+      return lines
+        .slice(start - 1, end)
+        .map((line, idx) => `${start + idx}\t${line}`)
+        .join('\n');
+    },
+  });
+
   // NOTE: 'env', 'find', and 'make' are intentionally excluded because they can
   // execute arbitrary sub-commands (env sh -c ..., find -exec ..., Makefile recipes).
   const ALLOWED_COMMANDS = [
@@ -1079,7 +1450,7 @@ function createTools(projectDir, allowedRoots, policy, profile = 'full') {
     execute: async ({ reason }) => `${WRITE_ACCESS_SENTINEL}\n${String(reason || '').trim()}`,
   });
 
-  const tools = [listFiles, globFiles, readFile];
+  const tools = [listChangedFiles, readDiff, readFileAtRevision, listFiles, globFiles, readFile];
 
   const writeIsDisallowed = hasAnyDisallowedTool(policy, [
     'Write',
@@ -1131,10 +1502,21 @@ function buildDefaultPrompt({
     : `You are a coding assistant with access to a project directory at: ${projectDir}`;
 
   if (profile === 'read_only') {
-    return `${dirIntro}\n\nYou are operating in read-only review mode. You can list files, glob for candidate filenames, read files, read targeted line ranges, search for patterns, and run read-only shell commands.\nAlways explore the project structure before making changes.\nPrefer filename discovery with glob, then shallow/paginated list_files, then targeted read_file line ranges before broad searches.\nUse search_files only when you need content matches instead of filename discovery.${parallelToolCalls ? '\nBatch independent read-only tool calls in parallel when helpful.' : ''}\nDo not attempt edits in this mode.${canEscalateToWrite ? '\nIf the task truly requires edits or broader shell access, call request_write_access with a brief reason. The system will rerun with write-capable tools and any additional shell access permitted by policy.' : ''}\nKeep responses concise and focused on the task.`;
+    return `${dirIntro}\n\nYou are operating in read-only review mode. You can inspect git-native review targets with list_changed_files, read_diff, and read_file_at_revision, plus list files, glob for candidate filenames, read files, read targeted line ranges, search for patterns, and run read-only shell commands.\nFor review or audit tasks, start with list_changed_files and read_diff for the requested uncommitted changes, commit, or diff range before broad filesystem exploration.\nWhen a diff points to a suspicious file, prefer read_file_at_revision or targeted read_file line ranges before reading whole files.\nUse glob for filename discovery and search_files only when you need content matches instead of filename discovery.${parallelToolCalls ? '\nBatch independent read-only tool calls in parallel when helpful.' : ''}\nDo not attempt edits in this mode.${canEscalateToWrite ? '\nIf the task truly requires edits or broader shell access, call request_write_access with a brief reason. The system will rerun with write-capable tools and any additional shell access permitted by policy.' : ''}\nKeep responses concise and focused on the task.`;
   }
 
-  return `${dirIntro}\n\nYou can list files, glob for candidate filenames, read files, read targeted line ranges, replace exact text within files, write files, search for patterns, and run shell commands.\nAlways explore the project structure before making changes.\nPrefer filename discovery with glob, shallow/paginated list_files, targeted reads, and exact replacements for small edits.\nKeep responses concise and focused on the task.`;
+  return `${dirIntro}\n\nYou can inspect git-native review targets with list_changed_files, read_diff, and read_file_at_revision, plus list files, glob for candidate filenames, read files, read targeted line ranges, replace exact text within files, write files, search for patterns, and run shell commands.\nFor review or audit tasks, start with list_changed_files and read_diff before broad filesystem exploration.\nPrefer filename discovery with glob, shallow/paginated list_files, targeted reads, and exact replacements for small edits.\nKeep responses concise and focused on the task.`;
+}
+
+function buildSystemPrompt(defaultPrompt, incomingSystemPrompt) {
+  const normalizedIncoming = typeof incomingSystemPrompt === 'string'
+    ? incomingSystemPrompt.trim()
+    : '';
+  if (!normalizedIncoming) {
+    return defaultPrompt;
+  }
+
+  return `${normalizedIncoming}\n\nAdditional provider runtime guidance:\n${defaultPrompt}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,7 +1581,7 @@ const openaiProvider = {
         canEscalateToWrite,
         parallelToolCalls,
       });
-      const systemPrompt = input.systemPrompt || defaultPrompt;
+      const systemPrompt = buildSystemPrompt(defaultPrompt, input.systemPrompt);
       const promptCacheKey = getSessionKey(requestedSessionId, sessionProfile);
 
       const client = new OpenAI({
