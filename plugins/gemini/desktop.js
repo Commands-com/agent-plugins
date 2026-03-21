@@ -36,6 +36,12 @@ export default {
       required: false,
       label: 'API Key (optional — falls back to Gemini CLI OAuth)',
     },
+    safeMode: {
+      type: 'boolean',
+      required: false,
+      label: 'Safe Mode (restrict shell commands)',
+      default: true,
+    }
   },
 
   /**
@@ -45,8 +51,12 @@ export default {
     return {
       models: [
         'gemini-3.1-pro-preview',
+        'gemini-3.1-pro-preview-customtools',
+        'gemini-3-pro-preview',
+        'gemini-3-flash-preview',
+        'gemini-2.5-pro',
         'gemini-2.5-flash',
-        'gemini-2.0-flash',
+        'gemini-2.5-flash-lite',
       ],
     };
   },
@@ -82,6 +92,9 @@ export default {
     if (config?.apiKey) {
       env.PROVIDER_GEMINI_API_KEY = config.apiKey;
     }
+
+    const isSafeMode = config?.safeMode !== false;
+    env.PROVIDER_GEMINI_SAFE_MODE = isSafeMode ? 'true' : 'false';
 
     return env;
   },

@@ -12,11 +12,26 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { OAuth2Client } from 'google-auth-library';
 import readline from 'node:readline';
 import { Readable } from 'node:stream';
 import { validatePathArgsWithinProject } from '../openai/path-guard.mjs';
+
+
+function normalizeToolName(name) {
+  return String(name || '').trim().toLowerCase();
+}
+
+function hasDisallowedTool(policy, toolName) {
+  if (!policy || !Array.isArray(policy.disallowedTools)) return false;
+  const wanted = normalizeToolName(toolName);
+  return policy.disallowedTools.some((t) => normalizeToolName(t) === wanted);
+}
+
+function hasAnyDisallowedTool(policy, toolNames) {
+  return toolNames.some((toolName) => hasDisallowedTool(policy, toolName));
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -271,12 +286,14 @@ async function apiStreamPost(auth, method, body, signal) {
       const targetParts = fullResponse.response.candidates[0].content.parts;
 
       for (const part of parts) {
-        if (part.text) {
+        if (part.text !== undefined) {
           const lastPart = targetParts[targetParts.length - 1];
-          if (lastPart && lastPart.text !== undefined) {
+          if (lastPart && lastPart.text !== undefined && !!lastPart.thought === !!part.thought) {
             lastPart.text += part.text;
           } else {
-            targetParts.push({ text: part.text });
+            const newPart = { text: part.text };
+            if (part.thought) newPart.thought = true;
+            targetParts.push(newPart);
           }
         } else if (part.functionCall) {
           // Carry over the thoughtSignature natively if it exists
@@ -346,8 +363,11 @@ async function generateContentWithRetry(auth, initialModel, requestBodyBase) {
 
   const fallbacks = {
     'gemini-3.1-pro-preview': 'gemini-3-pro-preview',
-    'gemini-3-pro-preview': 'gemini-2.5-flash',
-    'gemini-2.5-flash': 'gemini-2.0-flash'
+    'gemini-3.1-pro-preview-customtools': 'gemini-3-pro-preview',
+    'gemini-3-pro-preview': 'gemini-3-flash-preview',
+    'gemini-3-flash-preview': 'gemini-2.5-pro',
+    'gemini-2.5-pro': 'gemini-2.5-flash',
+    'gemini-2.5-flash': 'gemini-2.5-flash-lite'
   };
 
   while (attempt < maxAttempts) {
@@ -411,7 +431,7 @@ async function generateContentWithRetry(auth, initialModel, requestBodyBase) {
 // ---------------------------------------------------------------------------
 // Tool declarations (Gemini functionDeclarations format)
 // ---------------------------------------------------------------------------
-function buildToolDeclarations() {
+function buildToolDeclarations(policy) {
   return [{
     functionDeclarations: [
       {
@@ -434,6 +454,42 @@ function buildToolDeclarations() {
             path: { type: 'STRING', description: 'Relative file path within the project' },
           },
           required: ['path'],
+        },
+      },
+      {
+        name: 'replace',
+        description: 'Replaces exact literal text within a file.',
+        parameters: {
+          type: 'OBJECT',
+          properties: {
+            path: { type: 'STRING', description: 'Relative path to the file' },
+            old_string: { type: 'STRING', description: 'The exact literal text to replace' },
+            new_string: { type: 'STRING', description: 'The exact literal text to replace it with' },
+            allow_multiple: { type: 'BOOLEAN', description: 'If true, replaces all occurrences' }
+          },
+          required: ['path', 'old_string', 'new_string'],
+        },
+      },
+      {
+        name: 'glob',
+        description: 'Find files matching a pattern (e.g., **/*.ts) using find/grep.',
+        parameters: {
+          type: 'OBJECT',
+          properties: {
+            pattern: { type: 'STRING', description: 'The file pattern to search for' },
+          },
+          required: ['pattern'],
+        },
+      },
+      {
+        name: 'generalist',
+        description: 'A general-purpose AI sub-agent. Use this to delegate complex, multi-step, or turn-intensive tasks to keep your main context lean.',
+        parameters: {
+          type: 'OBJECT',
+          properties: {
+            request: { type: 'STRING', description: 'The detailed task or question for the sub-agent.' },
+          },
+          required: ['request'],
         },
       },
       {
@@ -478,22 +534,36 @@ function buildToolDeclarations() {
 // ---------------------------------------------------------------------------
 // Tool execution (mirrors OpenAI plugin tools)
 // ---------------------------------------------------------------------------
-function createSafePath(projectDir) {
-  const realProjectDir = fs.realpathSync(projectDir);
+
+function createSafePath(primaryRoot, allowedRoots) {
+  const realPrimary = fs.realpathSync(primaryRoot);
+  const realRoots = allowedRoots.map((r) => {
+    try { return fs.realpathSync(r); } catch { return r; }
+  });
+
+  function isUnderAnyRoot(resolvedPath) {
+    return realRoots.some(
+      (root) => resolvedPath === root || resolvedPath.startsWith(root + path.sep),
+    );
+  }
+
   return (relPath) => {
-    const resolved = path.resolve(realProjectDir, relPath || '.');
+    const resolved = path.isAbsolute(relPath)
+      ? path.resolve(relPath)
+      : path.resolve(realPrimary, relPath || '.');
     let real;
     try {
       real = fs.realpathSync(resolved);
     } catch {
       real = resolved;
     }
-    if (!real.startsWith(realProjectDir + path.sep) && real !== realProjectDir) {
-      throw new Error(`Path escapes project directory: ${relPath}`);
+    if (!isUnderAnyRoot(real)) {
+      throw new Error(`Path escapes allowed directories: ${relPath}`);
     }
     return real;
   };
 }
+
 
 const ALLOWED_COMMANDS = [
   'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'ag',
@@ -551,8 +621,8 @@ function parseCommand(cmd) {
   return tokens;
 }
 
-function executeTool(name, args, projectDir) {
-  const safePath = createSafePath(projectDir);
+async function executeTool(name, args, projectDir, context) {
+  const safePath = createSafePath(projectDir, context.allowedRoots || [projectDir]);
 
   switch (name) {
     case 'list_files': {
@@ -586,35 +656,99 @@ function executeTool(name, args, projectDir) {
         return `Search error: ${err.message}`;
       }
     }
-    case 'run_command': {
-      const command = args.command;
-      if (SHELL_META_RE.test(command)) {
-        return 'Command rejected: shell operators (;, |, &&, >, $, etc.) are not allowed.';
-      }
-      if (!isCommandAllowed(command)) {
-        return `Command not allowed. Only read-only and build/test commands are permitted. Allowed prefixes: ${ALLOWED_COMMANDS.slice(0, 10).join(', ')}, ...`;
-      }
+
+    case 'replace': {
+      const target = safePath(args.path);
+      const content = fs.readFileSync(target, 'utf8');
+      const { old_string, new_string, allow_multiple } = args;
+      const count = content.split(old_string).length - 1;
+      if (count === 0) return 'Error: old_string not found in file.';
+      if (count > 1 && !allow_multiple) return 'Error: old_string found multiple times. Set allow_multiple to true to replace all.';
+      
+      const newContent = allow_multiple ? content.replaceAll(old_string, new_string) : content.replace(old_string, new_string);
+      fs.writeFileSync(target, newContent);
+      return `Replaced ${count} occurrence(s) in ${args.path}`;
+    }
+    case 'glob': {
       try {
-        const [program, ...cmdArgs] = parseCommand(command.trim());
-        validatePathArgsWithinProject(projectDir, program, cmdArgs, FILE_READING_PROGRAMS);
-        const result = execFileSync(program, cmdArgs, {
-          cwd: projectDir,
-          encoding: 'utf8',
-          maxBuffer: 1024 * 1024,
-          timeout: 30000,
-        });
-        const lines = result.split('\n');
-        if (lines.length > 100) {
-          return lines.slice(0, 100).join('\n') + '\n... (truncated)';
-        }
-        return result || '(no output)';
+         const result = execSync(`find . -type f -name "${args.pattern.replace(/[^a-zA-Z0-9_.*-]/g, '')}"`, {
+           cwd: projectDir, encoding: 'utf8', maxBuffer: 1024 * 1024
+         });
+         const lines = result.trim().split('\n').filter(Boolean);
+         return lines.slice(0, 100).join('\n') + (lines.length > 100 ? '\n...(truncated)' : '');
       } catch (err) {
-        if (err.message && err.message.includes('escapes project directory')) {
-          return `Command rejected: ${err.message}`;
-        }
-        return `Exit code ${err.status || 1}\nstdout: ${err.stdout || ''}\nstderr: ${err.stderr || ''}`.trim();
+         return 'No files found or error executing search.';
       }
     }
+    case 'generalist': {
+       const sysPrompt = `You are a specialized generalist sub-agent working in ${projectDir}. 
+Your goal is to solve the following task and report back the final outcome or findings to the main agent.
+Be concise.
+Task: ${args.request}`;
+       const result = await runAgentLoop({
+           auth: context.auth,
+           projectId: context.projectId,
+           model: context.model,
+           systemPrompt: sysPrompt,
+           initialMessage: args.request,
+           maxTurns: 50,
+           projectDir,
+           safeMode: context.safeMode,
+      allowedRoots,
+      policy: input.policy,
+           resumeSessionId: null
+       });
+       return `Sub-agent completed task.\nResult:\n${result.result}`;
+    }
+    case 'run_command': {
+      const command = args.command;
+      if (context.safeMode) {
+          if (SHELL_META_RE.test(command)) {
+            return 'Command rejected: shell operators (;, |, &&, >, $, etc.) are not allowed in safe mode.';
+          }
+          if (!isCommandAllowed(command)) {
+            return `Command not allowed in safe mode. Allowed prefixes: ${ALLOWED_COMMANDS.slice(0, 10).join(', ')}, ...`;
+          }
+          try {
+            const [program, ...cmdArgs] = parseCommand(command.trim());
+            validatePathArgsWithinProject(context.allowedRoots || [projectDir], program, cmdArgs, FILE_READING_PROGRAMS);
+            const result = execFileSync(program, cmdArgs, {
+              cwd: projectDir,
+              encoding: 'utf8',
+              maxBuffer: 1024 * 1024,
+              timeout: 30000,
+            });
+            const lines = result.split('\n');
+            if (lines.length > 100) {
+              return lines.slice(0, 100).join('\n') + '\n... (truncated)';
+            }
+            return result || '(no output)';
+          } catch (err) {
+            if (err.message && err.message.includes('escapes project directory')) {
+              return `Command rejected: ${err.message}`;
+            }
+            return `Exit code ${err.status || 1}\nstdout: ${err.stdout || ''}\nstderr: ${err.stderr || ''}`.trim();
+          }
+      } else {
+          try {
+              const result = execSync(command, {
+                  cwd: projectDir,
+                  encoding: 'utf8',
+                  maxBuffer: 5 * 1024 * 1024,
+                  timeout: 120000,
+                  shell: true
+              });
+              const lines = result.split('\n');
+              if (lines.length > 200) {
+                  return lines.slice(0, 200).join('\n') + '\n... (truncated)';
+              }
+              return result || '(no output)';
+          } catch (err) {
+             return `Exit code ${err.status || 1}\nstdout: ${err.stdout || ''}\nstderr: ${err.stderr || ''}`.trim();
+          }
+      }
+    }
+
     default:
       return `Unknown tool: ${name}`;
   }
@@ -632,7 +766,7 @@ function extractResponseParts(response) {
   const functionCalls = [];
 
   for (const part of parts) {
-    if (part.text) {
+    if (part.text !== undefined && !part.thought) {
       text += part.text;
     }
     if (part.functionCall) {
@@ -646,62 +780,26 @@ function extractResponseParts(response) {
 // ---------------------------------------------------------------------------
 // ProviderPlugin export
 // ---------------------------------------------------------------------------
-const geminiProvider = {
-  id: 'gemini',
-  name: 'Gemini',
-  defaultModel: 'gemini-3.1-pro-preview',
-  capabilities: {
-    supportsTools: true,
-    supportsSessionResume: true,
-    supportsPolicy: false,
-  },
 
-  async runPrompt(input) {
-    const auth = await createOAuth2Client(input.providerConfig);
-    if (!auth) {
-      return {
-        result: 'Error: No credentials found. Set GEMINI_API_KEY, or run `gemini` CLI and sign in (creates ~/.gemini/oauth_creds.json).',
-        turns: 0,
-        costUsd: 0,
-        model: input.model || 'gemini-3.1-pro-preview',
-      };
+async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessage, maxTurns, projectDir, safeMode, resumeSessionId, allowedRoots, policy }) {
+    const { session, id: sessionId } = getOrCreateSession(resumeSessionId);
+
+    if (initialMessage) {
+      session.contents.push({
+        role: 'user',
+        parts: [{ text: initialMessage }],
+      });
     }
 
-    let model = input.model || 'gemini-3.1-pro-preview';
-    const projectDir = path.resolve(input.cwd || '.');
-    const maxTurns = input.maxTurns && input.maxTurns > 0 ? input.maxTurns : 500;
-
-    const systemPrompt = input.systemPrompt || `You are a coding assistant with access to a project directory at: ${projectDir}
-
-You can list files, read files, write files, search for patterns, and run shell commands.
-Always explore the project structure before making changes.
-When editing files, read them first to understand the context.
-Keep responses concise and focused on the task.`;
-
-    // Bootstrap project ID (required by CodeAssist endpoint)
-    const projectId = await getProjectId(auth);
-
-    // Get or create session for conversation history
-    const { session, id: sessionId } = getOrCreateSession(input.resumeSessionId);
-
-    // Add user message to conversation history
-    session.contents.push({
-      role: 'user',
-      parts: [{ text: input.prompt }],
-    });
-
-    // Tool call loop
     let turns = 0;
     let finalText = '';
 
     while (turns < maxTurns) {
       turns++;
 
-      // Pre-process session contents to add required thought signatures
-      // (This exact logic exists in the core Gemini CLI to prevent 400 errors)
       const validatedContents = ensureActiveLoopHasThoughtSignatures(session.contents);
 
-      // Build request body base (without model, which might change during fallback)
+      const context = { auth, projectId, model, safeMode, maxTurns, allowedRoots, policy };
       const requestBodyBase = {
         project: projectId,
         request: {
@@ -710,8 +808,8 @@ Keep responses concise and focused on the task.`;
             role: 'system',
             parts: [{ text: systemPrompt }],
           },
-          tools: buildToolDeclarations(),
-          generationConfig: model.includes('thinking')
+          tools: buildToolDeclarations(context?.policy),
+          generationConfig: model.includes('thinking') || ['gemini-3.1-pro-preview', 'gemini-3.1-pro-preview-customtools', 'gemini-3-pro-preview'].includes(model)
             ? { thinkingConfig: { include_thoughts: true } }
             : {},
         },
@@ -721,7 +819,6 @@ Keep responses concise and focused on the task.`;
       try {
         const result = await generateContentWithRetry(auth, model, requestBodyBase);
         response = result.response;
-        // Update model in case a fallback occurred during generation
         model = result.model;
       } catch (err) {
         logDebug(`Gemini API error after all retries: ${err.message}\n\n---\n\n`);
@@ -736,25 +833,23 @@ Keep responses concise and focused on the task.`;
 
       const { text, functionCalls, parts } = extractResponseParts(response);
 
-      // Add model response to conversation history
       const modelParts = parts.length > 0 ? parts : [{ text: text || '' }];
       session.contents.push({
         role: 'model',
         parts: modelParts,
       });
 
-      // If no function calls, we're done
       if (functionCalls.length === 0) {
         finalText = text;
         break;
       }
 
-      // Execute function calls and send results back
       const functionResponseParts = [];
       for (const fc of functionCalls) {
         let result;
         try {
-          result = executeTool(fc.name, fc.args || {}, projectDir);
+          // context already defined above
+          result = await executeTool(fc.name, fc.args || {}, projectDir, context);
         } catch (err) {
           result = `Tool error: ${err.message}`;
         }
@@ -766,13 +861,11 @@ Keep responses concise and focused on the task.`;
         });
       }
 
-      // Add function responses to conversation history
       session.contents.push({
         role: 'user',
         parts: functionResponseParts,
       });
 
-      // If this was the last allowed turn, extract any text we got
       if (turns >= maxTurns) {
         finalText = text || '(max tool rounds reached)';
       }
@@ -785,6 +878,68 @@ Keep responses concise and focused on the task.`;
       model,
       sessionId,
     };
+}
+
+const geminiProvider = {
+  id: 'gemini',
+  name: 'Gemini',
+  defaultModel: 'gemini-3.1-pro-preview',
+  capabilities: {
+    supportsTools: true,
+    supportsSessionResume: true,
+    supportsPolicy: true,
+  },
+
+  async runPrompt(input) {
+    const auth = await createOAuth2Client(input.providerConfig);
+    if (!auth) {
+      return {
+        result: 'Error: No credentials found. Set GEMINI_API_KEY, or run `gemini` CLI and sign in (creates ~/.gemini/oauth_creds.json).',
+        turns: 0,
+        costUsd: 0,
+        model: input.model || 'gemini-3.1-pro-preview',
+      };
+    }
+
+    let model = input.model || 'gemini-3.1-pro-preview';
+    
+    const projectDir = path.resolve(input.cwd || '.');
+    const allowedRoots = [projectDir];
+    if (input.policy?.allowedCwdRoots?.length) {
+      for (const root of input.policy.allowedCwdRoots) {
+        const resolved = path.resolve(root);
+        if (!allowedRoots.includes(resolved)) allowedRoots.push(resolved);
+      }
+    }
+
+    const maxTurns = input.maxTurns && input.maxTurns > 0 ? input.maxTurns : 500;
+    
+    const safeMode = input.providerConfig?.SAFE_MODE !== 'false';
+
+    let defaultPrompt;
+    if (allowedRoots.length > 1) {
+      const dirList = allowedRoots.map((r) => `  - ${r}`).join('\n');
+      defaultPrompt = `You are a coding assistant with access to multiple project directories:\n${dirList}\n\nYour primary working directory is: ${projectDir}\nRelative paths resolve against the primary directory. Use absolute paths to access other directories.\nYou can list files, read files, write files, search for patterns, and run shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nKeep responses concise and focused on the task.`;
+    } else {
+      defaultPrompt = `You are a coding assistant with access to a project directory at: ${projectDir}\n\nYou can list files, read files, write files, search for patterns, and run shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nKeep responses concise and focused on the task.`;
+    }
+    const systemPrompt = input.systemPrompt || defaultPrompt;
+
+    const projectId = await getProjectId(auth);
+
+    const result = await runAgentLoop({
+      auth,
+      projectId,
+      model,
+      systemPrompt,
+      initialMessage: input.prompt,
+      maxTurns,
+      projectDir,
+      safeMode,
+      resumeSessionId: input.resumeSessionId
+    });
+
+    return result;
   },
 };
 
