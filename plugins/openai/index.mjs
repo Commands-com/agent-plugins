@@ -3,7 +3,7 @@
  *
  * Uses Codex OAuth (from ~/.codex/auth.json) with the @openai/agents SDK
  * and a custom fetch adapter that injects:
- *   store: false, stream: true, reasoning: { effort: 'xhigh' }
+ *   store: false, stream: true, and efficient default reasoning/text controls
  *
  * Provides file-system tools scoped to input.cwd and policy.allowedCwdRoots.
  */
@@ -37,6 +37,11 @@ const MAX_SESSIONS = 200;
 const CONTEXT_WINDOW_TOKENS = 272_000;
 const COMPACT_TOKEN_THRESHOLD = Math.floor(CONTEXT_WINDOW_TOKENS * 0.9);  // ~244,800 tokens
 const CHARS_PER_TOKEN = 4;
+const DEFAULT_REASONING_EFFORT = 'xhigh';
+const DEFAULT_TEXT_VERBOSITY = 'low';
+const ALLOWED_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh']);
+const ALLOWED_TEXT_VERBOSITIES = new Set(['low', 'medium', 'high']);
+const WRITE_ACCESS_SENTINEL = '__OPENAI_PROVIDER_WRITE_ACCESS_REQUEST__';
 
 const sessions = new Map();
 
@@ -55,11 +60,61 @@ function evictOldestSession() {
   }
 }
 
-function getOrCreateSession(sessionId, client, model) {
-  if (sessionId && sessions.has(sessionId)) {
-    return { session: sessions.get(sessionId), id: sessionId };
+function normalizeStringChoice(value, allowedValues, fallback) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return fallback;
+  return allowedValues.has(normalized) ? normalized : fallback;
+}
+
+function getReasoningEffort(providerConfig) {
+  return normalizeStringChoice(
+    providerConfig?.REASONING_EFFORT ?? process.env.PROVIDER_OPENAI_REASONING_EFFORT,
+    ALLOWED_REASONING_EFFORTS,
+    DEFAULT_REASONING_EFFORT,
+  );
+}
+
+function getTextVerbosity(providerConfig) {
+  return normalizeStringChoice(
+    providerConfig?.TEXT_VERBOSITY ?? process.env.PROVIDER_OPENAI_TEXT_VERBOSITY,
+    ALLOWED_TEXT_VERBOSITIES,
+    DEFAULT_TEXT_VERBOSITY,
+  );
+}
+
+function getBooleanConfig(providerConfig, key, fallback = false) {
+  const directValue = providerConfig?.[key];
+  if (typeof directValue === 'boolean') return directValue;
+  if (typeof directValue === 'string') {
+    const normalized = directValue.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
   }
-  const id = sessionId || `openai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  const envValue = process.env[`PROVIDER_OPENAI_${key}`];
+  if (typeof envValue === 'string') {
+    const normalized = envValue.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  }
+
+  return fallback;
+}
+
+function ensureSessionId(sessionId) {
+  return sessionId || `openai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getSessionKey(sessionId, profile = 'default') {
+  return `${sessionId}:${profile}`;
+}
+
+function getOrCreateSession(sessionId, client, model, profile = 'default') {
+  const id = ensureSessionId(sessionId);
+  const key = getSessionKey(id, profile);
+  if (sessions.has(key)) {
+    return { session: sessions.get(key), id, key };
+  }
   evictOldestSession();
   const session = new OpenAIResponsesCompactionSession({
     client, model,
@@ -69,8 +124,8 @@ function getOrCreateSession(sessionId, client, model) {
       return estimatedTokens >= COMPACT_TOKEN_THRESHOLD;
     },
   });
-  sessions.set(id, session);
-  return { session, id };
+  sessions.set(key, session);
+  return { session, id, key };
 }
 
 // ---------------------------------------------------------------------------
@@ -96,15 +151,23 @@ function loadAccessToken(providerConfig) {
   return null;
 }
 
-function createCodexFetch(instructions) {
+function createCodexFetch({
+  instructions,
+  reasoningEffort,
+  textVerbosity,
+  model,
+  promptCacheKey,
+  parallelToolCalls,
+}) {
   return async (url, init) => {
     // Only intercept /responses calls (the Agents SDK endpoint)
     if (typeof url === 'string' && !url.includes('/responses')) {
       return globalThis.fetch(url, init);
     }
 
-    // Handle /responses/compact separately — don't inject stream/reasoning,
-    // do inject the required `instructions` field, and return JSON directly.
+    // Handle /responses/compact separately — inject the same request controls
+    // we use on /responses, plus the required `instructions` field, and return
+    // JSON directly.
     const isCompact = typeof url === 'string' && url.includes('/responses/compact');
 
     if (typeof init?.body === 'string') {
@@ -114,6 +177,20 @@ function createCodexFetch(instructions) {
           // Compact endpoint requires `instructions`; SDK doesn't send it
           if (!b.instructions && instructions) {
             b.instructions = instructions;
+          }
+          if (parallelToolCalls) {
+            b.parallel_tool_calls = true;
+          }
+          if (!b.reasoning || typeof b.reasoning !== 'object') {
+            b.reasoning = { effort: reasoningEffort };
+          } else if (!b.reasoning.effort) {
+            b.reasoning = { ...b.reasoning, effort: reasoningEffort };
+          }
+          if (typeof model === 'string' && model.toLowerCase().startsWith('gpt-5')) {
+            const textControls = (b.text && typeof b.text === 'object') ? b.text : {};
+            if (!textControls.verbosity) {
+              b.text = { ...textControls, verbosity: textVerbosity };
+            }
           }
           // Strip rs_* IDs from input items — responses aren't persisted with store: false
           if (Array.isArray(b.input)) {
@@ -128,7 +205,23 @@ function createCodexFetch(instructions) {
         } else {
           b.store = false;
           b.stream = true;
-          b.reasoning = { effort: 'xhigh' };
+          if (parallelToolCalls) {
+            b.parallel_tool_calls = true;
+          }
+          if (!b.prompt_cache_key && promptCacheKey) {
+            b.prompt_cache_key = promptCacheKey;
+          }
+          if (!b.reasoning || typeof b.reasoning !== 'object') {
+            b.reasoning = { effort: reasoningEffort };
+          } else if (!b.reasoning.effort) {
+            b.reasoning = { ...b.reasoning, effort: reasoningEffort };
+          }
+          if (typeof model === 'string' && model.toLowerCase().startsWith('gpt-5')) {
+            const textControls = (b.text && typeof b.text === 'object') ? b.text : {};
+            if (!textControls.verbosity) {
+              b.text = { ...textControls, verbosity: textVerbosity };
+            }
+          }
           // The Codex endpoint requires store: false, which means response items
           // are never persisted. On follow-up requests the Agents SDK embeds
           // previous response items (with rs_* IDs) in the input array. Strip
@@ -426,12 +519,13 @@ async function connectPolicyMcpServers(inputMcpServers, policy) {
 // ---------------------------------------------------------------------------
 // Create tools scoped to allowed directories
 // ---------------------------------------------------------------------------
-function createTools(projectDir, allowedRoots, policy) {
+function createTools(projectDir, allowedRoots, policy, profile = 'full') {
   const safePath = createSafePath(projectDir, allowedRoots);
   const multiRoot = allowedRoots.length > 1;
   const pathDesc = multiRoot
     ? 'Path (relative to primary project root, or absolute path within any allowed directory)'
     : 'Relative path within the project';
+  const isReadOnlyProfile = profile === 'read_only';
 
   const listFiles = tool({
     name: 'list_files',
@@ -450,13 +544,30 @@ function createTools(projectDir, allowedRoots, policy) {
 
   const readFile = tool({
     name: 'read_file',
-    description: `Read the contents of a file. Returns the file text.${multiRoot ? ' Accepts absolute paths to any allowed directory.' : ''}`,
+    description: `Read the contents of a file. Optionally limit to a line range to reduce context use.${multiRoot ? ' Accepts absolute paths to any allowed directory.' : ''}`,
     parameters: z.object({
       path: z.string().describe(pathDesc),
+      start_line: z.number().int().positive().optional().describe('Optional 1-based starting line'),
+      end_line: z.number().int().positive().optional().describe('Optional 1-based ending line (inclusive)'),
     }),
-    execute: async ({ path: relPath }) => {
+    execute: async ({ path: relPath, start_line: startLine, end_line: endLine }) => {
       const target = safePath(relPath);
-      return fs.readFileSync(target, 'utf8');
+      const content = fs.readFileSync(target, 'utf8');
+      if (startLine == null && endLine == null) {
+        return content;
+      }
+
+      const lines = content.split('\n');
+      const start = Math.max(startLine || 1, 1);
+      const end = Math.max(endLine || start, start);
+      if (start > lines.length) {
+        return `Requested range ${start}-${end} is outside the file (length ${lines.length} lines).`;
+      }
+
+      return lines
+        .slice(start - 1, end)
+        .map((line, idx) => `${start + idx}\t${line}`)
+        .join('\n');
     },
   });
 
@@ -472,6 +583,38 @@ function createTools(projectDir, allowedRoots, policy) {
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.writeFileSync(target, content);
       return `Wrote ${content.length} bytes to ${relPath}`;
+    },
+  });
+
+  const replaceFile = tool({
+    name: 'replace',
+    description: `Replace exact literal text within a file. Prefer this over rewriting an entire file for small edits.${multiRoot ? ' Accepts absolute paths to any allowed directory.' : ''}`,
+    parameters: z.object({
+      path: z.string().describe(pathDesc),
+      old_string: z.string().describe('Exact literal text to replace'),
+      new_string: z.string().describe('Replacement text'),
+      allow_multiple: z.boolean().default(false).describe('Replace all matches when true'),
+    }),
+    execute: async ({ path: relPath, old_string: oldString, new_string: newString, allow_multiple: allowMultiple }) => {
+      if (!oldString) {
+        return 'Error: old_string cannot be empty.';
+      }
+
+      const target = safePath(relPath);
+      const content = fs.readFileSync(target, 'utf8');
+      const count = content.split(oldString).length - 1;
+      if (count === 0) {
+        return `Error: old_string not found in ${relPath}.`;
+      }
+      if (count > 1 && !allowMultiple) {
+        return `Error: old_string found ${count} times in ${relPath}. Set allow_multiple to true to replace all.`;
+      }
+
+      const nextContent = allowMultiple
+        ? content.replaceAll(oldString, newString)
+        : content.replace(oldString, newString);
+      fs.writeFileSync(target, nextContent);
+      return `Replaced ${count} occurrence(s) in ${relPath}`;
     },
   });
 
@@ -524,11 +667,30 @@ function createTools(projectDir, allowedRoots, policy) {
       } else {
         for (const root of allowedRoots) {
           try {
-            const result = execFileSync(
-              'grep',
-              ['-rn', `--include=${globPattern}`, pattern, '.'],
-              { cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10000 },
-            );
+            const rgArgs = ['--line-number', '--no-heading', '--color', 'never'];
+            if (globPattern && globPattern !== '*') {
+              rgArgs.push('--glob', globPattern);
+            }
+            rgArgs.push(pattern, '.');
+
+            let result;
+            try {
+              result = execFileSync(
+                'rg',
+                rgArgs,
+                { cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10000 },
+              );
+            } catch (err) {
+              if (err.code === 'ENOENT') {
+                result = execFileSync(
+                  'grep',
+                  ['-rn', `--include=${globPattern}`, pattern, '.'],
+                  { cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10000 },
+                );
+              } else {
+                throw err;
+              }
+            }
             if (multiRoot) {
               const prefixed = result.split('\n')
                 .filter(Boolean)
@@ -552,8 +714,6 @@ function createTools(projectDir, allowedRoots, policy) {
     },
   });
 
-  // Allowed command prefixes for run_command — read-only and build/test commands only.
-  // Commands not matching these prefixes are rejected.
   // NOTE: 'env', 'find', and 'make' are intentionally excluded because they can
   // execute arbitrary sub-commands (env sh -c ..., find -exec ..., Makefile recipes).
   const ALLOWED_COMMANDS = [
@@ -566,6 +726,12 @@ function createTools(projectDir, allowedRoots, policy) {
     'cargo build', 'cargo test', 'cargo check', 'cargo clippy',
     'python -m pytest', 'pytest', 'go test', 'go build', 'go vet',
     'echo', 'pwd', 'which', 'date', 'whoami',
+    'tree', 'du', 'df', 'file', 'stat',
+  ];
+  const ALLOWED_READ_ONLY_COMMANDS = [
+    'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'ag',
+    'git status', 'git log', 'git diff', 'git show', 'git branch', 'git tag', 'git rev-parse',
+    'pwd', 'which', 'date', 'whoami',
     'tree', 'du', 'df', 'file', 'stat',
   ];
 
@@ -586,21 +752,33 @@ function createTools(projectDir, allowedRoots, policy) {
   // Built-in "full" compiles to mode:none, so input.policy is undefined.
   // In that case, bypass the static fallback allowlist to preserve full-access semantics.
   const isFullProfileWithoutPolicy = !policy && runtimePermissionProfile === 'full';
-  const runCommandDescription = policy
-    ? (shellAllowSummary
-      ? `Run one non-interactive command allowed by the permission profile. Allowed command prefixes include: ${shellAllowSummary}.`
-      : 'Run one non-interactive command, constrained by the permission profile.')
-    : (isFullProfileWithoutPolicy
-      ? 'Run one non-interactive command in the project directory. Full Access profile detected, so command-prefix allowlist checks are not applied.'
-      : 'Run an allowed command in the project directory (no shell). Permitted: build, test, lint, git read-only, file inspection. Destructive or network commands are blocked.');
+  const bypassStaticAllowList = !isReadOnlyProfile && isFullProfileWithoutPolicy;
+  const commandAllowList = isReadOnlyProfile ? ALLOWED_READ_ONLY_COMMANDS : ALLOWED_COMMANDS;
+  const runCommandDescription = isReadOnlyProfile
+    ? (policy
+      ? (shellAllowSummary
+        ? `Run one non-interactive read-only command allowed by the permission profile. Allowed command prefixes include: ${shellAllowSummary}.`
+        : 'Run one non-interactive read-only command, constrained by the permission profile.')
+      : 'Run an allowed read-only command in the project directory (no shell). Permitted: file inspection and git read-only commands. Build, test, edit, network, and destructive commands are blocked.')
+    : (policy
+      ? (shellAllowSummary
+        ? `Run one non-interactive command allowed by the permission profile. Allowed command prefixes include: ${shellAllowSummary}.`
+        : 'Run one non-interactive command, constrained by the permission profile.')
+      : (bypassStaticAllowList
+        ? 'Run one non-interactive command in the project directory. Full Access profile detected, so command-prefix allowlist checks are not applied.'
+        : 'Run an allowed command in the project directory (no shell). Permitted: build, test, lint, git read-only, file inspection. Destructive or network commands are blocked.'));
 
   function isCommandAllowed(cmd) {
     const trimmed = cmd.trim();
-    return ALLOWED_COMMANDS.some(prefix => {
+    return commandAllowList.some(prefix => {
       if (trimmed === prefix) return true;
       if (trimmed.startsWith(prefix + ' ')) return true;
       return false;
     });
+  }
+
+  function formatAllowedPrefixes(prefixes) {
+    return prefixes.slice(0, 10).join(', ') + (prefixes.length > 10 ? ', ...' : '');
   }
 
   function validatePathArgs(program, args) {
@@ -659,8 +837,8 @@ function createTools(projectDir, allowedRoots, policy) {
       if (policyViolation) {
         return `Command rejected by permission profile: ${policyViolation}`;
       }
-      if (!policy && !isFullProfileWithoutPolicy && !isCommandAllowed(trimmedCommand)) {
-        return `Command not allowed. Only read-only and build/test commands are permitted. Allowed prefixes: ${ALLOWED_COMMANDS.slice(0, 10).join(', ')}, ...`;
+      if (!policy && !bypassStaticAllowList && !isCommandAllowed(trimmedCommand)) {
+        return `Command not allowed. Allowed prefixes: ${formatAllowedPrefixes(commandAllowList)}`;
       }
 
       try {
@@ -690,6 +868,15 @@ function createTools(projectDir, allowedRoots, policy) {
     },
   });
 
+  const requestWriteAccess = tool({
+    name: 'request_write_access',
+    description: 'Request a rerun with write-capable tools and broader shell access when permitted by policy. Use this only when the task truly requires changes beyond read-only inspection.',
+    parameters: z.object({
+      reason: z.string().min(1).describe('Brief reason why write-capable tools are needed'),
+    }),
+    execute: async ({ reason }) => `${WRITE_ACCESS_SENTINEL}\n${String(reason || '').trim()}`,
+  });
+
   const tools = [listFiles, readFile];
 
   const writeIsDisallowed = hasAnyDisallowedTool(policy, [
@@ -699,7 +886,8 @@ function createTools(projectDir, allowedRoots, policy) {
     'NotebookEdit',
     'NotebookWrite',
   ]);
-  if (!writeIsDisallowed) {
+  if (!writeIsDisallowed && !isReadOnlyProfile) {
+    tools.push(replaceFile);
     tools.push(writeFile);
   }
 
@@ -709,8 +897,42 @@ function createTools(projectDir, allowedRoots, policy) {
   if (!bashIsDisallowed) {
     tools.push(runCommand);
   }
+  if (isReadOnlyProfile && !writeIsDisallowed) {
+    tools.push(requestWriteAccess);
+  }
 
   return tools;
+}
+
+function parseWriteAccessRequest(output) {
+  if (typeof output !== 'string' || !output.startsWith(WRITE_ACCESS_SENTINEL)) {
+    return null;
+  }
+  return output.slice(WRITE_ACCESS_SENTINEL.length).trim() || 'Write-capable tools are required.';
+}
+
+function buildDefaultPrompt({
+  projectDir,
+  allowedRoots,
+  toolUseEnabled,
+  profile,
+  canEscalateToWrite,
+  parallelToolCalls,
+}) {
+  if (!toolUseEnabled) {
+    return 'You are a coding assistant.\n\nFile, shell, and MCP tools are disabled for this turn. Answer directly from the conversation context and keep responses concise and focused on the task.';
+  }
+
+  const multiRoot = allowedRoots.length > 1;
+  const dirIntro = multiRoot
+    ? `You are a coding assistant with access to multiple project directories:\n${allowedRoots.map((r) => `  - ${r}`).join('\n')}\n\nYour primary working directory is: ${projectDir}\nRelative paths resolve against the primary directory. Use absolute paths to access other directories.`
+    : `You are a coding assistant with access to a project directory at: ${projectDir}`;
+
+  if (profile === 'read_only') {
+    return `${dirIntro}\n\nYou are operating in read-only review mode. You can list files, read files, read targeted line ranges, search for patterns, and run read-only shell commands.\nAlways explore the project structure before making changes.\nPrefer targeted reads to keep context small.${parallelToolCalls ? '\nBatch independent read-only tool calls in parallel when helpful.' : ''}\nDo not attempt edits in this mode.${canEscalateToWrite ? '\nIf the task truly requires edits or broader shell access, call request_write_access with a brief reason. The system will rerun with write-capable tools and any additional shell access permitted by policy.' : ''}\nKeep responses concise and focused on the task.`;
+  }
+
+  return `${dirIntro}\n\nYou can list files, read files, read targeted line ranges, replace exact text within files, write files, search for patterns, and run shell commands.\nAlways explore the project structure before making changes.\nPrefer targeted reads and exact replacements for small edits.\nKeep responses concise and focused on the task.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +962,13 @@ const openaiProvider = {
     const baseUrl = input.providerConfig?.BASE_URL || 'https://chatgpt.com/backend-api/codex';
     const model = input.model || 'gpt-5.4';
     const projectDir = path.resolve(input.cwd || '.');
+    const requestedSessionId = ensureSessionId(input.resumeSessionId);
+    const toolUseEnabled = input.allowToolUse !== false;
+    const reasoningEffort = getReasoningEffort(input.providerConfig);
+    const textVerbosity = getTextVerbosity(input.providerConfig);
+    const readOnlyFirst = toolUseEnabled && getBooleanConfig(input.providerConfig, 'READ_ONLY_FIRST', true);
+    const allowParallelReadOnlyTurns = toolUseEnabled && getBooleanConfig(input.providerConfig, 'PARALLEL_TOOL_CALLS', true);
+    const maxTurns = input.maxTurns && input.maxTurns > 0 ? input.maxTurns : 500;
 
     // Build the full set of allowed roots from policy (if available)
     const allowedRoots = [projectDir];
@@ -750,46 +979,83 @@ const openaiProvider = {
       }
     }
 
-    // Build system prompt before client so we can pass it to the fetch adapter
-    // for /responses/compact calls (Codex requires `instructions` on compact)
-    let defaultPrompt;
-    if (allowedRoots.length > 1) {
-      const dirList = allowedRoots.map((r) => `  - ${r}`).join('\n');
-      defaultPrompt = `You are a coding assistant with access to multiple project directories:\n${dirList}\n\nYour primary working directory is: ${projectDir}\nRelative paths resolve against the primary directory. Use absolute paths to access other directories.\nYou can list files, read files, write files, search for patterns, and run shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nKeep responses concise and focused on the task.`;
-    } else {
-      defaultPrompt = `You are a coding assistant with access to a project directory at: ${projectDir}\n\nYou can list files, read files, write files, search for patterns, and run shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nKeep responses concise and focused on the task.`;
-    }
-    const systemPrompt = input.systemPrompt || defaultPrompt;
+    const canEscalateToWrite = !hasAnyDisallowedTool(input.policy, [
+      'Write',
+      'Edit',
+      'MultiEdit',
+      'NotebookEdit',
+      'NotebookWrite',
+    ]);
 
-    // Set up OpenAI client with Codex fetch adapter
-    const client = new OpenAI({
-      apiKey: accessToken,
-      baseURL: baseUrl,
-      fetch: createCodexFetch(systemPrompt),
-    });
-    setDefaultOpenAIClient(client);
-
-    const mcpSession = await connectPolicyMcpServers(input.mcpServers, input.policy);
-    try {
-      // Build agent with file-system tools scoped to allowed directories
-      const tools = createTools(projectDir, allowedRoots, input.policy);
-
-      const agent = new Agent({
-        name: 'Coder',
-        instructions: systemPrompt,
-        model,
-        tools,
-        ...(mcpSession?.active?.length ? { mcpServers: mcpSession.active } : {}),
+    async function runStage({ profile, prompt, sessionProfile, enableMcp, toolUseBehavior }) {
+      const parallelToolCalls = profile === 'read_only' && allowParallelReadOnlyTurns;
+      const defaultPrompt = buildDefaultPrompt({
+        projectDir,
+        allowedRoots,
+        toolUseEnabled,
+        profile,
+        canEscalateToWrite,
+        parallelToolCalls,
       });
+      const systemPrompt = input.systemPrompt || defaultPrompt;
+      const promptCacheKey = getSessionKey(requestedSessionId, sessionProfile);
 
-      // Use SDK compaction session for conversation history management + auto-compaction
-      const { session, id: sessionId } = getOrCreateSession(input.resumeSessionId, client, model);
+      const client = new OpenAI({
+        apiKey: accessToken,
+        baseURL: baseUrl,
+        fetch: createCodexFetch({
+          instructions: systemPrompt,
+          reasoningEffort,
+          textVerbosity,
+          model,
+          promptCacheKey,
+          parallelToolCalls,
+        }),
+      });
+      setDefaultOpenAIClient(client);
 
-      // Run the agent — pass maxTurns from input so room fan-out's
-      // max_tool_rounds constraint is respected (SDK defaults to 10).
-      const maxTurns = input.maxTurns && input.maxTurns > 0 ? input.maxTurns : 500;
-      const result = await run(agent, input.prompt, { maxTurns, session });
+      const mcpSession = enableMcp
+        ? await connectPolicyMcpServers(input.mcpServers, input.policy)
+        : null;
+      try {
+        const agentConfig = {
+          name: 'Coder',
+          instructions: systemPrompt,
+          model,
+        };
+        if (toolUseEnabled) {
+          agentConfig.tools = createTools(projectDir, allowedRoots, input.policy, profile);
+          if (toolUseBehavior) {
+            agentConfig.toolUseBehavior = toolUseBehavior;
+          }
+          if (mcpSession?.active?.length) {
+            agentConfig.mcpServers = mcpSession.active;
+          }
+        }
 
+        const agent = new Agent(agentConfig);
+        const { session, id: sessionId } = getOrCreateSession(requestedSessionId, client, model, sessionProfile);
+        const result = await run(agent, prompt, { maxTurns, session });
+        return { result, sessionId };
+      } finally {
+        if (mcpSession) {
+          try {
+            await mcpSession.close();
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            process.stderr.write(`[openai-provider] failed to close MCP session: ${message}\n`);
+          }
+        }
+      }
+    }
+
+    if (!toolUseEnabled) {
+      const { result, sessionId } = await runStage({
+        profile: 'full',
+        prompt: input.prompt,
+        sessionProfile: 'no_tools',
+        enableMcp: false,
+      });
       return {
         result: result.finalOutput || '',
         turns: 1,
@@ -797,16 +1063,58 @@ const openaiProvider = {
         model,
         sessionId,
       };
-    } finally {
-      if (mcpSession) {
-        try {
-          await mcpSession.close();
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          process.stderr.write(`[openai-provider] failed to close MCP session: ${message}\n`);
-        }
-      }
     }
+
+    if (!readOnlyFirst) {
+      const { result, sessionId } = await runStage({
+        profile: 'full',
+        prompt: input.prompt,
+        sessionProfile: 'full',
+        enableMcp: true,
+      });
+      return {
+        result: result.finalOutput || '',
+        turns: 1,
+        costUsd: 0,
+        model,
+        sessionId,
+      };
+    }
+
+    const readOnlyStage = await runStage({
+      profile: 'read_only',
+      prompt: input.prompt,
+      sessionProfile: 'read_only',
+      enableMcp: false,
+      toolUseBehavior: canEscalateToWrite ? { stopAtToolNames: ['request_write_access'] } : undefined,
+    });
+    const writeAccessReason = canEscalateToWrite
+      ? parseWriteAccessRequest(readOnlyStage.result.finalOutput)
+      : null;
+
+    if (!writeAccessReason) {
+      return {
+        result: readOnlyStage.result.finalOutput || '',
+        turns: 1,
+        costUsd: 0,
+        model,
+        sessionId: readOnlyStage.sessionId,
+      };
+    }
+
+    const fullStage = await runStage({
+      profile: 'full',
+      prompt: `${input.prompt}\n\nWrite-capable tools have been granted for this turn because: ${writeAccessReason}\nContinue and complete the task.`,
+      sessionProfile: 'full',
+      enableMcp: true,
+    });
+    return {
+      result: fullStage.result.finalOutput || '',
+      turns: 2,
+      costUsd: 0,
+      model,
+      sessionId: fullStage.sessionId,
+    };
   },
 };
 

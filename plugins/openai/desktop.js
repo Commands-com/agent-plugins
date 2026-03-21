@@ -42,6 +42,12 @@ export default {
       label: 'Base URL',
       default: DEFAULT_BASE_URL,
     },
+    readOnlyFirst: {
+      type: 'boolean',
+      required: false,
+      label: 'Read-Only First (parallel reviews)',
+      default: true,
+    },
   },
 
   /**
@@ -93,6 +99,9 @@ export default {
     if (config?.baseUrl) {
       env.PROVIDER_OPENAI_BASE_URL = config.baseUrl;
     }
+
+    const readOnlyFirst = config?.readOnlyFirst !== false;
+    env.PROVIDER_OPENAI_READ_ONLY_FIRST = readOnlyFirst ? 'true' : 'false';
 
     return env;
   },
