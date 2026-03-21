@@ -384,14 +384,7 @@ async function generateContentWithRetry(auth, initialModel, requestBodyBase) {
       // 1. Handle explicit server wait times
       const resetMatch = msg.match(/reset after (\d+)s/);
       if (resetMatch) {
-        const waitSeconds = parseInt(resetMatch[1], 10);
-        if (waitSeconds <= 60) {
-           logDebug(`Rate limited on ${model}. Waiting ${waitSeconds}s (attempt ${attempt}/${maxAttempts})...`);
-           await delay((waitSeconds + 1) * 1000);
-           continue; 
-        } else {
-           error.isExhausted = true; 
-        }
+         error.isExhausted = true; 
       }
 
       // 2. Handle Terminal Quota / Exhaustion with Model Fallbacks
@@ -809,9 +802,7 @@ async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessa
             parts: [{ text: systemPrompt }],
           },
           tools: buildToolDeclarations(context?.policy),
-          generationConfig: model.includes('thinking') || ['gemini-3.1-pro-preview', 'gemini-3.1-pro-preview-customtools', 'gemini-3-pro-preview'].includes(model)
-            ? { thinkingConfig: { include_thoughts: true } }
-            : {},
+          generationConfig: {},
         },
       };
 
