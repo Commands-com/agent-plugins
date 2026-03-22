@@ -106,7 +106,9 @@ Install just one plugin, for example `gemini`:
 node scripts/install-plugins.mjs --plugin gemini
 ```
 
-Both scripts copy the selected plugins and install npm dependencies.
+Both scripts copy the selected plugins, install npm dependencies, and generate
+`providers-allowed.json` next to the providers directory so Commands can verify
+the installed plugins by SHA-256.
 
 | Platform | Default providers directory |
 |---|---|
@@ -115,10 +117,12 @@ Both scripts copy the selected plugins and install npm dependencies.
 
 Then in Commands Desktop:
 
-1. Go to **Settings > Developer**.
-2. Enable **Dev Mode** and **Trust All Plugins**.
-3. Restart the app.
-4. Create or edit an agent profile and select provider `openai` or `gemini`.
+1. Restart the app if it was already running.
+2. Create or edit an agent profile and select provider `openai` or `gemini`.
+
+`Dev Mode` + `Trust All Plugins` is still available as a local-development
+bypass, but it is no longer required for plugins installed through the verified
+allowlist flow.
 
 List available plugin IDs:
 
@@ -180,18 +184,29 @@ Restart Commands Desktop. Your provider appears in agent create/edit.
 
 ## CLI / Runtime Usage
 
-External providers are only loaded when plugin verification is explicitly enabled.
+External providers load when they are present in the verified provider allowlist.
+
+The installer in this repo writes:
+
+- `~/.commands-com/workspace/providers`
+- `~/.commands-com/workspace/providers-allowed.json`
 
 ```bash
-COMMANDS_AGENT_DEV=1 \
-COMMANDS_AGENT_TRUST_ALL_PLUGINS=1 \
-node dist/index.js start
+commands-com start
 ```
 
 Optional custom plugin path:
 
 ```bash
 COMMANDS_AGENT_PROVIDERS_DIR=/custom/providers/path
+```
+
+For local development without an allowlist, you can still bypass verification:
+
+```bash
+COMMANDS_AGENT_DEV=1 \
+COMMANDS_AGENT_TRUST_ALL_PLUGINS=1 \
+commands-com start
 ```
 
 ## Manual Install
@@ -207,6 +222,11 @@ mkdir -p ~/.commands-com/workspace/providers
 rsync -a --delete ./plugins/gemini/ ~/.commands-com/workspace/providers/gemini/
 
 npm install --prefix ~/.commands-com/workspace/providers/gemini --omit=dev
+
+node ./scripts/generate-provider-allowlist.mjs \
+  --managed-only \
+  ~/.commands-com/workspace/providers \
+  ~/.commands-com/workspace/providers-allowed.json
 ```
 
 Install both:
@@ -217,6 +237,11 @@ rsync -a --delete ./plugins/gemini/ ~/.commands-com/workspace/providers/gemini/
 
 npm install --prefix ~/.commands-com/workspace/providers/openai --omit=dev
 npm install --prefix ~/.commands-com/workspace/providers/gemini --omit=dev
+
+node ./scripts/generate-provider-allowlist.mjs \
+  --managed-only \
+  ~/.commands-com/workspace/providers \
+  ~/.commands-com/workspace/providers-allowed.json
 ```
 
 </details>
@@ -302,6 +327,7 @@ plugins/gemini           Gemini provider (index.mjs, desktop.js)
 plugins/echo-sample      Reference provider (index.mjs, desktop.mjs)
 scripts/install-plugins.sh    Bash installer (macOS/Linux)
 scripts/install-plugins.mjs   Node.js installer (cross-platform)
+scripts/generate-provider-allowlist.mjs  Generate provider allowlist with SHA-256 pins
 docs/CONTRACT.md         Full provider contract specification
 GETTING_STARTED.md       Step-by-step setup guide
 ```

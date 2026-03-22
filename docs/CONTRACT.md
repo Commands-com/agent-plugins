@@ -203,11 +203,14 @@ External provider loading path:
 
 Important current behavior:
 
-- external provider plugins load only when trust mode is enabled
+- external provider plugins are verified against `providers-allowed.json`
+- default allowlist path: `~/.commands-com/workspace/providers-allowed.json`
+- installer in this repo writes the allowlist automatically
+
+Development bypass:
+
 - in desktop app: enable `Settings -> Developer -> Dev Mode` and `Trust All Plugins`
 - env equivalent: `COMMANDS_AGENT_DEV=1` and `COMMANDS_AGENT_TRUST_ALL_PLUGINS=1`
-
-Without trust mode, external provider loading is disabled.
 
 ## 7. Installation Flow (This Repo)
 
@@ -218,6 +221,7 @@ Use:
 ```
 
 This copies `./plugins/*` into `~/.commands-com/workspace/providers` and installs production dependencies.
+It also writes `~/.commands-com/workspace/providers-allowed.json` with SHA-256 pins for the installed plugins.
 
 ## 8. Quality Checklist
 

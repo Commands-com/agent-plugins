@@ -3,7 +3,7 @@
  * Cross-platform plugin installer.
  * Replaces install-plugins.sh for Windows/macOS/Linux compatibility.
  *
- * Usage: node scripts/install-plugins.mjs [--plugin <name>] [--dest <dir>] [--skip-npm-install] [--list]
+ * Usage: node scripts/install-plugins.mjs [options]
  */
 
 import fs from 'node:fs';
@@ -24,12 +24,14 @@ function getDefaultDestDir() {
 }
 
 function usage() {
-  console.log(`Usage: node scripts/install-plugins.mjs [--plugin <name>]... [--dest <dir>] [--skip-npm-install] [--list]
+  console.log(`Usage: node scripts/install-plugins.mjs [options]
 
 Options:
   --plugin <name>      Install only the named plugin (repeatable)
   --dest <dir>          Destination providers directory
                         (default: ${getDefaultDestDir()})
+  --allowlist <file>    Allowlist output file (derived from --dest parent by default)
+  --skip-allowlist      Do not write allowlist file
   --skip-npm-install    Skip npm install in installed plugin directories
   --list                List available plugins and exit
   -h, --help            Show this help`);
@@ -37,6 +39,9 @@ Options:
 
 // Parse args
 let destDir = process.env.COMMANDS_AGENT_PROVIDERS_DIR || getDefaultDestDir();
+let allowlistPath = '';
+let allowlistExplicit = false;
+let writeAllowlist = true;
 let installDeps = true;
 let listOnly = false;
 const selectedPlugins = [];
@@ -59,6 +64,18 @@ for (let i = 0; i < args.length; i++) {
         process.exit(1);
       }
       selectedPlugins.push(args[++i]);
+      break;
+    case '--allowlist':
+      if (i + 1 >= args.length) {
+        console.error('Missing value for --allowlist');
+        usage();
+        process.exit(1);
+      }
+      allowlistPath = args[++i];
+      allowlistExplicit = true;
+      break;
+    case '--skip-allowlist':
+      writeAllowlist = false;
       break;
     case '--skip-npm-install':
       installDeps = false;
@@ -147,6 +164,10 @@ function syncDir(srcDir, destDirPath) {
 
 fs.mkdirSync(destDir, { recursive: true });
 
+if (!allowlistExplicit) {
+  allowlistPath = path.join(path.dirname(path.resolve(destDir)), 'providers-allowed.json');
+}
+
 console.log(`Installing plugins from: ${pluginsDir}`);
 console.log(`Destination: ${destDir}`);
 
@@ -196,6 +217,13 @@ if (selectedPlugins.length === 0) {
       fs.rmSync(path.join(destDir, dirName), { recursive: true, force: true });
     }
   }
+}
+
+if (writeAllowlist) {
+  const allowlistScript = path.join(repoRoot, 'scripts', 'generate-provider-allowlist.mjs');
+  execFileSync(process.execPath, [allowlistScript, '--managed-only', destDir, allowlistPath], {
+    stdio: 'inherit',
+  });
 }
 
 console.log('Install complete. Restart Commands Desktop if it is running.');

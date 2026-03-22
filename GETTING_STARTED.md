@@ -52,23 +52,17 @@ node scripts/install-plugins.mjs --plugin gemini
 What the script does:
 - Copies plugins into the providers directory (`~/.commands-com/workspace/providers` on macOS/Linux, `%LOCALAPPDATA%\commands-com\workspace\providers` on Windows)
 - Installs each selected plugin's production dependencies
+- Writes `providers-allowed.json` next to the providers directory with SHA-256 pins for the installed plugins
 
-## 3. Enable external plugins in Desktop
+## 3. Restart Desktop and select the provider
 
-In the app:
-1. Open `Settings`.
-2. Open `Developer`.
-3. Turn on `Dev Mode`.
-4. Turn on `Trust All Plugins`.
-5. Restart the app.
-
-## 4. Create or edit an agent profile
+Restart the app if it was already running, then create or edit an agent profile.
 
 Choose provider:
 - `openai`
 - `gemini`
 
-## 5. Configure credentials
+## 4. Configure credentials
 
 ### OpenAI plugin
 
@@ -82,7 +76,7 @@ Use either:
 - provider `apiKey` in profile settings, or
 - Gemini OAuth at `~/.gemini/oauth_creds.json` (run `gemini` and sign in)
 
-## 6. Update plugins later
+## 5. Update plugins later
 
 ```bash
 cd commands-com-agent-plugins
@@ -98,7 +92,7 @@ Or update just one plugin:
 node scripts/install-plugins.mjs --plugin gemini
 ```
 
-## 7. Remove plugins
+## 6. Remove plugins
 
 **macOS / Linux:**
 
@@ -123,3 +117,14 @@ Remove only Gemini:
 ```powershell
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-com\workspace\providers\gemini"
 ```
+
+## 7. Local development bypass
+
+If you are iterating on an unpublished plugin and do not want to maintain
+`providers-allowed.json` yet, you can still bypass verification:
+
+1. Open `Settings`.
+2. Open `Developer`.
+3. Turn on `Dev Mode`.
+4. Turn on `Trust All Plugins`.
+5. Restart the app.

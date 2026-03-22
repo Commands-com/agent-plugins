@@ -3,12 +3,14 @@ set -euo pipefail
 
 usage() {
   cat <<USAGE
-Usage: ./scripts/install-plugins.sh [--plugin <name>]... [--dest <dir>] [--skip-npm-install] [--list]
+Usage: ./scripts/install-plugins.sh [options]
 
 Options:
   --plugin <name>      Install only the named plugin (repeatable)
   --dest <dir>          Destination providers directory
                         (default: ~/.commands-com/workspace/providers)
+  --allowlist <file>    Allowlist output file (derived from --dest parent by default)
+  --skip-allowlist      Do not write allowlist file
   --skip-npm-install    Skip npm install in installed plugin directories
   --list                List available plugins and exit
   -h, --help            Show this help
@@ -16,6 +18,9 @@ USAGE
 }
 
 DEST_DIR="$HOME/.commands-com/workspace/providers"
+ALLOWLIST_PATH=""
+ALLOWLIST_EXPLICIT=0
+WRITE_ALLOWLIST=1
 INSTALL_DEPS=1
 LIST_ONLY=0
 SELECTED_PLUGINS=()
@@ -31,6 +36,16 @@ while [[ $# -gt 0 ]]; do
       DEST_DIR="$2"
       shift 2
       ;;
+    --allowlist)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for --allowlist" >&2
+        usage
+        exit 1
+      fi
+      ALLOWLIST_PATH="$2"
+      ALLOWLIST_EXPLICIT=1
+      shift 2
+      ;;
     --plugin)
       if [[ $# -lt 2 ]]; then
         echo "Missing value for --plugin" >&2
@@ -39,6 +54,10 @@ while [[ $# -gt 0 ]]; do
       fi
       SELECTED_PLUGINS+=("$2")
       shift 2
+      ;;
+    --skip-allowlist)
+      WRITE_ALLOWLIST=0
+      shift
       ;;
     --skip-npm-install)
       INSTALL_DEPS=0
@@ -105,6 +124,10 @@ fi
 
 mkdir -p "${DEST_DIR}"
 
+if [[ "${ALLOWLIST_EXPLICIT}" -eq 0 ]]; then
+  ALLOWLIST_PATH="$(cd "${DEST_DIR}" && cd .. && pwd)/providers-allowed.json"
+fi
+
 echo "Installing plugins from: ${PLUGINS_DIR}"
 echo "Destination: ${DEST_DIR}"
 if [[ "${#SELECTED_PLUGINS[@]}" -gt 0 ]]; then
@@ -123,14 +146,7 @@ for plugin_name in "${plugins_to_install[@]}"; do
   echo "[${plugin_name}] sync -> ${dest_plugin_path}"
   mkdir -p "${dest_plugin_path}"
 
-  # Only exclude node_modules when we will run npm install afterwards.
-  # When --skip-npm-install is used, preserve source node_modules so that
-  # plugins with vendored/preinstalled dependencies are copied intact.
-  if [[ "${INSTALL_DEPS}" -eq 1 ]]; then
-    rsync -a --delete --exclude '.DS_Store' --exclude 'node_modules/' "${plugin_path}/" "${dest_plugin_path}/"
-  else
-    rsync -a --delete --exclude '.DS_Store' "${plugin_path}/" "${dest_plugin_path}/"
-  fi
+  rsync -a --delete --exclude '.DS_Store' --exclude 'node_modules/' "${plugin_path}/" "${dest_plugin_path}/"
 
   # Write a marker so the prune step can identify directories managed by this
   # installer and leave third-party provider folders untouched.
@@ -169,6 +185,10 @@ if [[ "${#SELECTED_PLUGINS[@]}" -eq 0 ]]; then
       fi
     fi
   done
+fi
+
+if [[ "${WRITE_ALLOWLIST}" -eq 1 ]]; then
+  node "${REPO_ROOT}/scripts/generate-provider-allowlist.mjs" --managed-only "${DEST_DIR}" "${ALLOWLIST_PATH}"
 fi
 
 echo "Install complete. Restart Commands Desktop if it is running."
