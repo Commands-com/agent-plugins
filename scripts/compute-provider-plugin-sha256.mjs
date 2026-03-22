@@ -9,7 +9,7 @@ async function collectPluginFiles(dirPath, relativePath = '') {
   const files = [];
 
   for (const entry of entries) {
-    if (entry.name === '.DS_Store' || entry.name === '.git') {
+    if (entry.name === '.DS_Store' || entry.name === '.git' || entry.name === 'node_modules') {
       const excludedPath = path.join(dirPath, entry.name);
       const excludedStat = await fs.lstat(excludedPath);
       if (excludedStat.isSymbolicLink()) {
