@@ -6,7 +6,7 @@ Use it with the sample in `plugins/echo-sample` to build production-quality prov
 
 ## 1. Plugin Folder Layout
 
-Each provider plugin is a folder under the providers directory (default: `~/.commands-agent/providers`).
+Each provider plugin is a folder under the providers directory (default: `~/.commands-com/workspace/providers`).
 
 Required files:
 
@@ -199,7 +199,7 @@ If you implement `buildEnv`, prefer emitting `PROVIDER_<NORMALIZED_ID>_<KEY>` va
 External provider loading path:
 
 - `COMMANDS_AGENT_PROVIDERS_DIR`
-- default: `~/.commands-agent/providers`
+- default: `~/.commands-com/workspace/providers`
 
 Important current behavior:
 
@@ -217,7 +217,7 @@ Use:
 ./scripts/install-plugins.sh
 ```
 
-This copies `./plugins/*` into `~/.commands-agent/providers` and installs production dependencies.
+This copies `./plugins/*` into `~/.commands-com/workspace/providers` and installs production dependencies.
 
 ## 8. Quality Checklist
 
@@ -236,4 +236,3 @@ Start with:
 - `plugins/echo-sample/package.json`
 - `plugins/echo-sample/index.mjs`
 - `plugins/echo-sample/desktop.mjs`
-

@@ -14,7 +14,7 @@ It validates the emitted tool schemas and prints the observed request flow.
 
 Defaults:
   --plugin-dir  ./plugins/openai
-  --deps-dir    ~/.commands-agent/providers/openai/node_modules
+  --deps-dir    ~/.commands-com/workspace/providers/openai/node_modules
   --cwd         current working directory
   --prompt      "review the current workspace"
   --scenario    basic
@@ -29,7 +29,7 @@ Scenarios:
 }
 
 let pluginDir = path.resolve('plugins/openai');
-let depsDir = path.join(os.homedir(), '.commands-agent', 'providers', 'openai', 'node_modules');
+let depsDir = path.join(os.homedir(), '.commands-com', 'workspace', 'providers', 'openai', 'node_modules');
 let cwd = process.cwd();
 let prompt = 'review the current workspace';
 let scenario = 'basic';

@@ -50,7 +50,7 @@ node scripts/install-plugins.mjs --plugin gemini
 ```
 
 What the script does:
-- Copies plugins into the providers directory (`~/.commands-agent/providers` on macOS/Linux, `%LOCALAPPDATA%\commands-agent\providers` on Windows)
+- Copies plugins into the providers directory (`~/.commands-com/workspace/providers` on macOS/Linux, `%LOCALAPPDATA%\commands-com\workspace\providers` on Windows)
 - Installs each selected plugin's production dependencies
 
 ## 3. Enable external plugins in Desktop
@@ -103,23 +103,23 @@ node scripts/install-plugins.mjs --plugin gemini
 **macOS / Linux:**
 
 ```bash
-rm -rf ~/.commands-agent/providers/openai ~/.commands-agent/providers/gemini
+rm -rf ~/.commands-com/workspace/providers/openai ~/.commands-com/workspace/providers/gemini
 ```
 
 Remove only Gemini:
 
 ```bash
-rm -rf ~/.commands-agent/providers/gemini
+rm -rf ~/.commands-com/workspace/providers/gemini
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-agent\providers\openai", "$env:LOCALAPPDATA\commands-agent\providers\gemini"
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-com\workspace\providers\openai", "$env:LOCALAPPDATA\commands-com\workspace\providers\gemini"
 ```
 
 Remove only Gemini:
 
 ```powershell
-Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-agent\providers\gemini"
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-com\workspace\providers\gemini"
 ```

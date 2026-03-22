@@ -8,14 +8,14 @@ Usage: ./scripts/install-plugins.sh [--plugin <name>]... [--dest <dir>] [--skip-
 Options:
   --plugin <name>      Install only the named plugin (repeatable)
   --dest <dir>          Destination providers directory
-                        (default: ~/.commands-agent/providers)
+                        (default: ~/.commands-com/workspace/providers)
   --skip-npm-install    Skip npm install in installed plugin directories
   --list                List available plugins and exit
   -h, --help            Show this help
 USAGE
 }
 
-DEST_DIR="$HOME/.commands-agent/providers"
+DEST_DIR="$HOME/.commands-com/workspace/providers"
 INSTALL_DEPS=1
 LIST_ONLY=0
 SELECTED_PLUGINS=()

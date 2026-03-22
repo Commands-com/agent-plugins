@@ -110,8 +110,8 @@ Both scripts copy the selected plugins and install npm dependencies.
 
 | Platform | Default providers directory |
 |---|---|
-| macOS / Linux | `~/.commands-agent/providers` |
-| Windows | `%LOCALAPPDATA%\commands-agent\providers` |
+| macOS / Linux | `~/.commands-com/workspace/providers` |
+| Windows | `%LOCALAPPDATA%\commands-com\workspace\providers` |
 
 Then in Commands Desktop:
 
@@ -202,21 +202,21 @@ If you only want Gemini, you can install only that provider.
 <summary><strong>macOS / Linux</strong></summary>
 
 ```bash
-mkdir -p ~/.commands-agent/providers
+mkdir -p ~/.commands-com/workspace/providers
 
-rsync -a --delete ./plugins/gemini/ ~/.commands-agent/providers/gemini/
+rsync -a --delete ./plugins/gemini/ ~/.commands-com/workspace/providers/gemini/
 
-npm install --prefix ~/.commands-agent/providers/gemini --omit=dev
+npm install --prefix ~/.commands-com/workspace/providers/gemini --omit=dev
 ```
 
 Install both:
 
 ```bash
-rsync -a --delete ./plugins/openai/ ~/.commands-agent/providers/openai/
-rsync -a --delete ./plugins/gemini/ ~/.commands-agent/providers/gemini/
+rsync -a --delete ./plugins/openai/ ~/.commands-com/workspace/providers/openai/
+rsync -a --delete ./plugins/gemini/ ~/.commands-com/workspace/providers/gemini/
 
-npm install --prefix ~/.commands-agent/providers/openai --omit=dev
-npm install --prefix ~/.commands-agent/providers/gemini --omit=dev
+npm install --prefix ~/.commands-com/workspace/providers/openai --omit=dev
+npm install --prefix ~/.commands-com/workspace/providers/gemini --omit=dev
 ```
 
 </details>
@@ -225,7 +225,7 @@ npm install --prefix ~/.commands-agent/providers/gemini --omit=dev
 <summary><strong>Windows (PowerShell)</strong></summary>
 
 ```powershell
-$dest = "$env:LOCALAPPDATA\commands-agent\providers"
+$dest = "$env:LOCALAPPDATA\commands-com\workspace\providers"
 New-Item -ItemType Directory -Force -Path "$dest\gemini"
 
 robocopy .\plugins\gemini "$dest\gemini" /MIR /XD node_modules
@@ -268,13 +268,13 @@ node scripts/install-plugins.mjs --plugin gemini
 <summary><strong>macOS / Linux</strong></summary>
 
 ```bash
-rm -rf ~/.commands-agent/providers/openai ~/.commands-agent/providers/gemini
+rm -rf ~/.commands-com/workspace/providers/openai ~/.commands-com/workspace/providers/gemini
 ```
 
 Remove only Gemini:
 
 ```bash
-rm -rf ~/.commands-agent/providers/gemini
+rm -rf ~/.commands-com/workspace/providers/gemini
 ```
 
 </details>
@@ -283,13 +283,13 @@ rm -rf ~/.commands-agent/providers/gemini
 <summary><strong>Windows (PowerShell)</strong></summary>
 
 ```powershell
-Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-agent\providers\openai", "$env:LOCALAPPDATA\commands-agent\providers\gemini"
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-com\workspace\providers\openai", "$env:LOCALAPPDATA\commands-com\workspace\providers\gemini"
 ```
 
 Remove only Gemini:
 
 ```powershell
-Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-agent\providers\gemini"
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-com\workspace\providers\gemini"
 ```
 
 </details>
