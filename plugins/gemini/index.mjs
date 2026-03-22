@@ -16,8 +16,11 @@ import { execFileSync, execSync } from 'node:child_process';
 import { OAuth2Client } from 'google-auth-library';
 import readline from 'node:readline';
 import { Readable } from 'node:stream';
-import { validatePathArgsWithinProject } from '../openai/path-guard.mjs';
+import { validatePathArgsWithinProject } from './path-guard.mjs';
 
+const READ_ONLY_TIER = 'read_only';
+const DEV_SAFE_TIER = 'dev_safe';
+const FULL_TIER = 'full';
 
 function normalizeToolName(name) {
   return String(name || '').trim().toLowerCase();
@@ -31,6 +34,37 @@ function hasDisallowedTool(policy, toolName) {
 
 function hasAnyDisallowedTool(policy, toolNames) {
   return toolNames.some((toolName) => hasDisallowedTool(policy, toolName));
+}
+
+const TOOL_ALIASES = {
+  list_files: ['list_files', 'read'],
+  read_file: ['read_file', 'read'],
+  search_files: ['search_files', 'search'],
+  glob: ['glob', 'search'],
+  generalist: ['generalist'],
+  write_file: ['write_file', 'write'],
+  replace: ['replace', 'edit', 'multiedit', 'write'],
+  run_command: ['run_command', 'bash'],
+};
+
+function getPermissionTier(policy, safeMode) {
+  if (policy?.mode === 'none' || policy?.preset === 'power') {
+    return FULL_TIER;
+  }
+  if (policy?.preset === 'safe') {
+    return READ_ONLY_TIER;
+  }
+  if (policy?.preset === 'balanced') {
+    return DEV_SAFE_TIER;
+  }
+  return safeMode === false ? FULL_TIER : DEV_SAFE_TIER;
+}
+
+function isToolEnabled(policy, permissionTier, toolName) {
+  if (permissionTier === READ_ONLY_TIER && ['write_file', 'replace', 'run_command'].includes(toolName)) {
+    return false;
+  }
+  return !hasAnyDisallowedTool(policy, TOOL_ALIASES[toolName] || [toolName]);
 }
 
 // ---------------------------------------------------------------------------
@@ -424,10 +458,9 @@ async function generateContentWithRetry(auth, initialModel, requestBodyBase) {
 // ---------------------------------------------------------------------------
 // Tool declarations (Gemini functionDeclarations format)
 // ---------------------------------------------------------------------------
-function buildToolDeclarations(policy) {
-  return [{
-    functionDeclarations: [
-      {
+function buildToolDeclarations(policy, permissionTier) {
+  const declarations = [
+    {
         name: 'list_files',
         description: 'List files and directories at a path (relative to project root). Returns names with / suffix for directories.',
         parameters: {
@@ -438,7 +471,7 @@ function buildToolDeclarations(policy) {
           required: [],
         },
       },
-      {
+    {
         name: 'read_file',
         description: 'Read the contents of a file (relative to project root). Returns the file text.',
         parameters: {
@@ -449,7 +482,7 @@ function buildToolDeclarations(policy) {
           required: ['path'],
         },
       },
-      {
+    {
         name: 'replace',
         description: 'Replaces exact literal text within a file.',
         parameters: {
@@ -463,7 +496,7 @@ function buildToolDeclarations(policy) {
           required: ['path', 'old_string', 'new_string'],
         },
       },
-      {
+    {
         name: 'glob',
         description: 'Find files matching a pattern (e.g., **/*.ts) using find/grep.',
         parameters: {
@@ -474,7 +507,7 @@ function buildToolDeclarations(policy) {
           required: ['pattern'],
         },
       },
-      {
+    {
         name: 'generalist',
         description: 'A general-purpose AI sub-agent. Use this to delegate complex, multi-step, or turn-intensive tasks to keep your main context lean.',
         parameters: {
@@ -485,7 +518,7 @@ function buildToolDeclarations(policy) {
           required: ['request'],
         },
       },
-      {
+    {
         name: 'write_file',
         description: 'Write content to a file (relative to project root). Creates parent directories if needed.',
         parameters: {
@@ -497,7 +530,7 @@ function buildToolDeclarations(policy) {
           required: ['path', 'content'],
         },
       },
-      {
+    {
         name: 'search_files',
         description: 'Search for a text pattern (regex) across files in the project. Returns matching file paths and line numbers.',
         parameters: {
@@ -509,7 +542,7 @@ function buildToolDeclarations(policy) {
           required: ['pattern'],
         },
       },
-      {
+    {
         name: 'run_command',
         description: 'Run an allowed command in the project directory. Permitted: build, test, lint, git read-only, file inspection. Destructive or network commands are blocked.',
         parameters: {
@@ -520,22 +553,33 @@ function buildToolDeclarations(policy) {
           required: ['command'],
         },
       },
-    ],
-  }];
+  ];
+
+  const enabled = declarations.filter((decl) => isToolEnabled(policy, permissionTier, decl.name));
+  return [{ functionDeclarations: enabled }];
 }
 
 // ---------------------------------------------------------------------------
 // Tool execution (mirrors OpenAI plugin tools)
 // ---------------------------------------------------------------------------
 
-function createSafePath(primaryRoot, allowedRoots) {
+function createSafePath(primaryRoot, allowedRoots, blockedRoots = []) {
   const realPrimary = fs.realpathSync(primaryRoot);
   const realRoots = allowedRoots.map((r) => {
+    try { return fs.realpathSync(r); } catch { return r; }
+  });
+  const realBlockedRoots = blockedRoots.map((r) => {
     try { return fs.realpathSync(r); } catch { return r; }
   });
 
   function isUnderAnyRoot(resolvedPath) {
     return realRoots.some(
+      (root) => resolvedPath === root || resolvedPath.startsWith(root + path.sep),
+    );
+  }
+
+  function isUnderBlockedRoot(resolvedPath) {
+    return realBlockedRoots.some(
       (root) => resolvedPath === root || resolvedPath.startsWith(root + path.sep),
     );
   }
@@ -552,6 +596,9 @@ function createSafePath(primaryRoot, allowedRoots) {
     }
     if (!isUnderAnyRoot(real)) {
       throw new Error(`Path escapes allowed directories: ${relPath}`);
+    }
+    if (isUnderBlockedRoot(real)) {
+      throw new Error(`Path is inside a blocked directory: ${relPath}`);
     }
     return real;
   };
@@ -615,7 +662,15 @@ function parseCommand(cmd) {
 }
 
 async function executeTool(name, args, projectDir, context) {
-  const safePath = createSafePath(projectDir, context.allowedRoots || [projectDir]);
+  const safePath = createSafePath(
+    projectDir,
+    context.allowedRoots || [projectDir],
+    context.blockedRoots || [],
+  );
+
+  if (!isToolEnabled(context.policy, context.permissionTier, name)) {
+    return `Tool not allowed under current permissions: ${name}`;
+  }
 
   switch (name) {
     case 'list_files': {
@@ -641,7 +696,18 @@ async function executeTool(name, args, projectDir, context) {
           ['-rn', `--include=${globPattern}`, args.pattern, '.'],
           { cwd: projectDir, encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10000 },
         );
-        const lines = result.split('\n');
+        const lines = result
+          .split('\n')
+          .filter(Boolean)
+          .filter((line) => {
+            const filePath = line.split(':', 1)[0];
+            try {
+              safePath(filePath);
+              return true;
+            } catch {
+              return false;
+            }
+          });
         const isTruncated = lines.length > 50;
         return lines.slice(0, 50).join('\n') + (isTruncated ? '\n... (truncated)' : '');
       } catch (err) {
@@ -667,7 +733,18 @@ async function executeTool(name, args, projectDir, context) {
          const result = execSync(`find . -type f -name "${args.pattern.replace(/[^a-zA-Z0-9_.*-]/g, '')}"`, {
            cwd: projectDir, encoding: 'utf8', maxBuffer: 1024 * 1024
          });
-         const lines = result.trim().split('\n').filter(Boolean);
+         const lines = result
+           .trim()
+           .split('\n')
+           .filter(Boolean)
+           .filter((line) => {
+             try {
+               safePath(line);
+               return true;
+             } catch {
+               return false;
+             }
+           });
          return lines.slice(0, 100).join('\n') + (lines.length > 100 ? '\n...(truncated)' : '');
       } catch (err) {
          return 'No files found or error executing search.';
@@ -687,15 +764,17 @@ Task: ${args.request}`;
            maxTurns: 50,
            projectDir,
            safeMode: context.safeMode,
-      allowedRoots,
-      policy: input.policy,
+           allowedRoots: context.allowedRoots,
+           blockedRoots: context.blockedRoots,
+           policy: context.policy,
+           permissionTier: context.permissionTier,
            resumeSessionId: null
        });
        return `Sub-agent completed task.\nResult:\n${result.result}`;
     }
     case 'run_command': {
       const command = args.command;
-      if (context.safeMode) {
+      if (context.permissionTier !== FULL_TIER) {
           if (SHELL_META_RE.test(command)) {
             return 'Command rejected: shell operators (;, |, &&, >, $, etc.) are not allowed in safe mode.';
           }
@@ -774,7 +853,7 @@ function extractResponseParts(response) {
 // ProviderPlugin export
 // ---------------------------------------------------------------------------
 
-async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessage, maxTurns, projectDir, safeMode, resumeSessionId, allowedRoots, policy }) {
+async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessage, maxTurns, projectDir, safeMode, resumeSessionId, allowedRoots, blockedRoots, policy, permissionTier }) {
     const { session, id: sessionId } = getOrCreateSession(resumeSessionId);
 
     if (initialMessage) {
@@ -792,7 +871,7 @@ async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessa
 
       const validatedContents = ensureActiveLoopHasThoughtSignatures(session.contents);
 
-      const context = { auth, projectId, model, safeMode, maxTurns, allowedRoots, policy };
+      const context = { auth, projectId, model, safeMode, maxTurns, allowedRoots, blockedRoots, policy, permissionTier };
       const requestBodyBase = {
         project: projectId,
         request: {
@@ -801,7 +880,7 @@ async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessa
             role: 'system',
             parts: [{ text: systemPrompt }],
           },
-          tools: buildToolDeclarations(context?.policy),
+          tools: buildToolDeclarations(context.policy, context.permissionTier),
           generationConfig: {},
         },
       };
@@ -902,17 +981,21 @@ const geminiProvider = {
         if (!allowedRoots.includes(resolved)) allowedRoots.push(resolved);
       }
     }
+    const blockedRoots = Array.isArray(input.policy?.blockedPathRoots)
+      ? input.policy.blockedPathRoots.map((root) => path.resolve(root))
+      : [];
 
     const maxTurns = input.maxTurns && input.maxTurns > 0 ? input.maxTurns : 500;
     
     const safeMode = input.providerConfig?.SAFE_MODE !== 'false';
+    const permissionTier = getPermissionTier(input.policy, safeMode);
 
     let defaultPrompt;
     if (allowedRoots.length > 1) {
       const dirList = allowedRoots.map((r) => `  - ${r}`).join('\n');
-      defaultPrompt = `You are a coding assistant with access to multiple project directories:\n${dirList}\n\nYour primary working directory is: ${projectDir}\nRelative paths resolve against the primary directory. Use absolute paths to access other directories.\nYou can list files, read files, write files, search for patterns, and run shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nKeep responses concise and focused on the task.`;
+      defaultPrompt = `You are a coding assistant with access to multiple project directories:\n${dirList}\n\nYour primary working directory is: ${projectDir}\nRelative paths resolve against the primary directory. Use absolute paths to access other directories.\nOperate only within the allowed directories and never use blocked paths.\nYour current permission tier is: ${permissionTier}.\nIn dev-safe mode, you may edit files within the workspace and run only safe local development commands. In read-only mode, do not attempt writes or shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nKeep responses concise and focused on the task.`;
     } else {
-      defaultPrompt = `You are a coding assistant with access to a project directory at: ${projectDir}\n\nYou can list files, read files, write files, search for patterns, and run shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nKeep responses concise and focused on the task.`;
+      defaultPrompt = `You are a coding assistant with access to a project directory at: ${projectDir}\n\nOperate only within the allowed directories and never use blocked paths.\nYour current permission tier is: ${permissionTier}.\nIn dev-safe mode, you may edit files within the workspace and run only safe local development commands. In read-only mode, do not attempt writes or shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nKeep responses concise and focused on the task.`;
     }
     const systemPrompt = input.systemPrompt || defaultPrompt;
 
@@ -927,6 +1010,10 @@ const geminiProvider = {
       maxTurns,
       projectDir,
       safeMode,
+      allowedRoots,
+      blockedRoots,
+      permissionTier,
+      policy: input.policy,
       resumeSessionId: input.resumeSessionId
     });
 

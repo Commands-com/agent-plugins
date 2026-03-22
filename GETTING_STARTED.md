@@ -1,6 +1,12 @@
 # Getting Started
 
-This guide gets you from a fresh desktop install to working provider plugins.
+This guide gets you from a fresh desktop install to working experimental provider plugins.
+
+Before you install anything:
+- Prefer built-in native CLI providers in Commands Desktop when they meet your needs.
+- These plugin adapters are experimental.
+- Depending on the provider, account type, and usage pattern, they may violate vendor terms of service or acceptable use policies. Review those terms yourself before using them.
+- The strongest current use case is the Gemini plugin when you want Gemini-like behavior with a provider-controlled sandboxed/tooling path instead of `gemini --yolo`.
 
 ## 1. Download and install Commands Desktop
 
@@ -11,9 +17,11 @@ Install the app, then launch it once.
 ## 2. Install provider plugins
 
 ```bash
-git clone https://github.com/dtannen/commands-com-agent-plugins.git
-cd commands-com-agent-plugins
+git clone https://github.com/Commands-com/agent-plugins.git
+cd agent-plugins
 ```
+
+Install everything:
 
 **macOS / Linux:**
 
@@ -27,9 +35,23 @@ cd commands-com-agent-plugins
 node scripts/install-plugins.mjs
 ```
 
+Install just one plugin, for example `gemini`:
+
+**macOS / Linux:**
+
+```bash
+./scripts/install-plugins.sh --plugin gemini
+```
+
+**Windows (or any platform with Node.js):**
+
+```bash
+node scripts/install-plugins.mjs --plugin gemini
+```
+
 What the script does:
 - Copies plugins into the providers directory (`~/.commands-agent/providers` on macOS/Linux, `%LOCALAPPDATA%\commands-agent\providers` on Windows)
-- Installs each plugin's production dependencies
+- Installs each selected plugin's production dependencies
 
 ## 3. Enable external plugins in Desktop
 
@@ -69,6 +91,13 @@ git pull
 node scripts/install-plugins.mjs    # Windows (or any platform)
 ```
 
+Or update just one plugin:
+
+```bash
+./scripts/install-plugins.sh --plugin gemini
+node scripts/install-plugins.mjs --plugin gemini
+```
+
 ## 7. Remove plugins
 
 **macOS / Linux:**
@@ -77,8 +106,20 @@ node scripts/install-plugins.mjs    # Windows (or any platform)
 rm -rf ~/.commands-agent/providers/openai ~/.commands-agent/providers/gemini
 ```
 
+Remove only Gemini:
+
+```bash
+rm -rf ~/.commands-agent/providers/gemini
+```
+
 **Windows (PowerShell):**
 
 ```powershell
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-agent\providers\openai", "$env:LOCALAPPDATA\commands-agent\providers\gemini"
+```
+
+Remove only Gemini:
+
+```powershell
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\commands-agent\providers\gemini"
 ```

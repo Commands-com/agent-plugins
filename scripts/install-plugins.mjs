@@ -3,7 +3,7 @@
  * Cross-platform plugin installer.
  * Replaces install-plugins.sh for Windows/macOS/Linux compatibility.
  *
- * Usage: node scripts/install-plugins.mjs [--dest <dir>] [--skip-npm-install]
+ * Usage: node scripts/install-plugins.mjs [--plugin <name>] [--dest <dir>] [--skip-npm-install] [--list]
  */
 
 import fs from 'node:fs';
@@ -24,18 +24,22 @@ function getDefaultDestDir() {
 }
 
 function usage() {
-  console.log(`Usage: node scripts/install-plugins.mjs [--dest <dir>] [--skip-npm-install]
+  console.log(`Usage: node scripts/install-plugins.mjs [--plugin <name>]... [--dest <dir>] [--skip-npm-install] [--list]
 
 Options:
+  --plugin <name>      Install only the named plugin (repeatable)
   --dest <dir>          Destination providers directory
                         (default: ${getDefaultDestDir()})
   --skip-npm-install    Skip npm install in installed plugin directories
+  --list                List available plugins and exit
   -h, --help            Show this help`);
 }
 
 // Parse args
 let destDir = process.env.COMMANDS_AGENT_PROVIDERS_DIR || getDefaultDestDir();
 let installDeps = true;
+let listOnly = false;
+const selectedPlugins = [];
 
 const args = process.argv.slice(2);
 for (let i = 0; i < args.length; i++) {
@@ -48,8 +52,19 @@ for (let i = 0; i < args.length; i++) {
       }
       destDir = args[++i];
       break;
+    case '--plugin':
+      if (i + 1 >= args.length) {
+        console.error('Missing value for --plugin');
+        usage();
+        process.exit(1);
+      }
+      selectedPlugins.push(args[++i]);
+      break;
     case '--skip-npm-install':
       installDeps = false;
+      break;
+    case '--list':
+      listOnly = true;
       break;
     case '-h':
     case '--help':
@@ -69,6 +84,16 @@ const pluginsDir = path.join(repoRoot, 'plugins');
 if (!fs.existsSync(pluginsDir)) {
   console.error(`Plugins directory not found: ${pluginsDir}`);
   process.exit(1);
+}
+
+const entries = fs.readdirSync(pluginsDir, { withFileTypes: true });
+const availablePlugins = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+
+if (listOnly) {
+  for (const pluginName of availablePlugins) {
+    console.log(pluginName);
+  }
+  process.exit(0);
 }
 
 // Skip list for files/dirs that should not be synced
@@ -125,16 +150,30 @@ fs.mkdirSync(destDir, { recursive: true });
 console.log(`Installing plugins from: ${pluginsDir}`);
 console.log(`Destination: ${destDir}`);
 
-const entries = fs.readdirSync(pluginsDir, { withFileTypes: true });
-for (const entry of entries) {
-  if (!entry.isDirectory()) continue;
+const selectedSet = new Set();
+if (selectedPlugins.length > 0) {
+  for (const pluginName of selectedPlugins) {
+    if (!availablePlugins.includes(pluginName)) {
+      console.error(`Unknown plugin: ${pluginName}`);
+      console.error(`Available plugins: ${availablePlugins.join(', ')}`);
+      process.exit(1);
+    }
+    selectedSet.add(pluginName);
+  }
+}
 
-  const pluginName = entry.name;
+const pluginsToInstall = selectedSet.size > 0 ? availablePlugins.filter((name) => selectedSet.has(name)) : availablePlugins;
+console.log(`Selected plugins: ${selectedPlugins.length > 0 ? pluginsToInstall.join(', ') : 'all'}`);
+
+for (const pluginName of pluginsToInstall) {
   const srcPluginPath = path.join(pluginsDir, pluginName);
   const destPluginPath = path.join(destDir, pluginName);
 
+  fs.mkdirSync(destPluginPath, { recursive: true });
+
   console.log(`[${pluginName}] sync -> ${destPluginPath}`);
   syncDir(srcPluginPath, destPluginPath);
+  fs.writeFileSync(path.join(destPluginPath, '.installed-by-commands-plugins'), 'installed by commands-com-agent-plugins\n', 'utf8');
 
   if (installDeps && fs.existsSync(path.join(destPluginPath, 'package.json'))) {
     console.log(`[${pluginName}] npm install --omit=dev`);
@@ -143,6 +182,19 @@ for (const entry of entries) {
       stdio: 'inherit',
       shell: process.platform === 'win32',
     });
+  }
+}
+
+if (selectedPlugins.length === 0) {
+  for (const entry of fs.readdirSync(destDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const dirName = entry.name;
+    if (pluginsToInstall.includes(dirName)) continue;
+    const installedMarker = path.join(destDir, dirName, '.installed-by-commands-plugins');
+    if (fs.existsSync(installedMarker)) {
+      console.log(`[${dirName}] removing stale provider directory`);
+      fs.rmSync(path.join(destDir, dirName), { recursive: true, force: true });
+    }
   }
 }
 

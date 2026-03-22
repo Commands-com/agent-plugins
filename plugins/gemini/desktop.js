@@ -27,6 +27,7 @@ async function hasGeminiAuth() {
 
 export default {
   id: 'gemini',
+  label: 'Gemini',
   apiVersion: '1',
   defaultModel: DEFAULT_MODEL,
 
@@ -39,7 +40,7 @@ export default {
     safeMode: {
       type: 'boolean',
       required: false,
-      label: 'Safe Mode (restrict shell commands)',
+      label: 'Fallback Dev-Safe Mode (used when no policy profile is supplied)',
       default: true,
     }
   },

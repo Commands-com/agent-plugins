@@ -3,18 +3,22 @@ set -euo pipefail
 
 usage() {
   cat <<USAGE
-Usage: ./scripts/install-plugins.sh [--dest <dir>] [--skip-npm-install]
+Usage: ./scripts/install-plugins.sh [--plugin <name>]... [--dest <dir>] [--skip-npm-install] [--list]
 
 Options:
+  --plugin <name>      Install only the named plugin (repeatable)
   --dest <dir>          Destination providers directory
                         (default: ~/.commands-agent/providers)
   --skip-npm-install    Skip npm install in installed plugin directories
+  --list                List available plugins and exit
   -h, --help            Show this help
 USAGE
 }
 
 DEST_DIR="$HOME/.commands-agent/providers"
 INSTALL_DEPS=1
+LIST_ONLY=0
+SELECTED_PLUGINS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -27,8 +31,21 @@ while [[ $# -gt 0 ]]; do
       DEST_DIR="$2"
       shift 2
       ;;
+    --plugin)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for --plugin" >&2
+        usage
+        exit 1
+      fi
+      SELECTED_PLUGINS+=("$2")
+      shift 2
+      ;;
     --skip-npm-install)
       INSTALL_DEPS=0
+      shift
+      ;;
+    --list)
+      LIST_ONLY=1
       shift
       ;;
     -h|--help)
@@ -52,16 +69,54 @@ if [[ ! -d "${PLUGINS_DIR}" ]]; then
   exit 1
 fi
 
+available_plugins=()
+for plugin_path in "${PLUGINS_DIR}"/*; do
+  [[ -d "${plugin_path}" ]] || continue
+  available_plugins+=("$(basename "${plugin_path}")")
+done
+
+if [[ "${LIST_ONLY}" -eq 1 ]]; then
+  printf '%s\n' "${available_plugins[@]}"
+  exit 0
+fi
+
+declare -A available_plugin_set=()
+for plugin_name in "${available_plugins[@]}"; do
+  available_plugin_set["${plugin_name}"]=1
+done
+
+plugins_to_install=()
+if [[ "${#SELECTED_PLUGINS[@]}" -gt 0 ]]; then
+  declare -A seen_selected=()
+  for plugin_name in "${SELECTED_PLUGINS[@]}"; do
+    if [[ -z "${available_plugin_set[${plugin_name}]:-}" ]]; then
+      echo "Unknown plugin: ${plugin_name}" >&2
+      echo "Available plugins: ${available_plugins[*]}" >&2
+      exit 1
+    fi
+    if [[ -z "${seen_selected[${plugin_name}]:-}" ]]; then
+      plugins_to_install+=("${plugin_name}")
+      seen_selected["${plugin_name}"]=1
+    fi
+  done
+else
+  plugins_to_install=("${available_plugins[@]}")
+fi
+
 mkdir -p "${DEST_DIR}"
 
 echo "Installing plugins from: ${PLUGINS_DIR}"
 echo "Destination: ${DEST_DIR}"
+if [[ "${#SELECTED_PLUGINS[@]}" -gt 0 ]]; then
+  echo "Selected plugins: ${plugins_to_install[*]}"
+else
+  echo "Selected plugins: all"
+fi
 
 installed_plugins=()
 
-for plugin_path in "${PLUGINS_DIR}"/*; do
-  [[ -d "${plugin_path}" ]] || continue
-  plugin_name="$(basename "${plugin_path}")"
+for plugin_name in "${plugins_to_install[@]}"; do
+  plugin_path="${PLUGINS_DIR}/${plugin_name}"
   dest_plugin_path="${DEST_DIR}/${plugin_name}"
   installed_plugins+=("${plugin_name}")
 
@@ -96,22 +151,24 @@ done
 # script but no longer exist in ./plugins.  Only directories containing the
 # marker file .installed-by-commands-plugins are considered; third-party
 # provider folders (or any other content) in the destination are never touched.
-for existing in "${DEST_DIR}"/*; do
-  [[ -d "${existing}" ]] || continue
-  dir_name="$(basename "${existing}")"
-  found=0
-  for kept in "${installed_plugins[@]}"; do
-    if [[ "${kept}" == "${dir_name}" ]]; then
-      found=1
-      break
+if [[ "${#SELECTED_PLUGINS[@]}" -eq 0 ]]; then
+  for existing in "${DEST_DIR}"/*; do
+    [[ -d "${existing}" ]] || continue
+    dir_name="$(basename "${existing}")"
+    found=0
+    for kept in "${installed_plugins[@]}"; do
+      if [[ "${kept}" == "${dir_name}" ]]; then
+        found=1
+        break
+      fi
+    done
+    if [[ "${found}" -eq 0 ]]; then
+      if [[ -f "${existing}/.installed-by-commands-plugins" ]]; then
+        echo "[${dir_name}] removing stale provider directory"
+        rm -rf "${existing}"
+      fi
     fi
   done
-  if [[ "${found}" -eq 0 ]]; then
-    if [[ -f "${existing}/.installed-by-commands-plugins" ]]; then
-      echo "[${dir_name}] removing stale provider directory"
-      rm -rf "${existing}"
-    fi
-  fi
-done
+fi
 
 echo "Install complete. Restart Commands Desktop if it is running."
