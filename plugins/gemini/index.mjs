@@ -625,6 +625,12 @@ const FILE_READING_PROGRAMS = new Set([
   'file', 'stat', 'tree', 'du', 'ls',
 ]);
 
+const SEARCH_TIMEOUT_MS = 15000;
+const SEARCH_MAX_BUFFER = 8 * 1024 * 1024;
+const SEARCH_FILE_LIMIT = 40;
+const SEARCH_LINES_PER_FILE = 3;
+const SEARCH_LINE_LIMIT = 120;
+
 function isCommandAllowed(cmd) {
   const trimmed = cmd.trim();
   return ALLOWED_COMMANDS.some(prefix => {
@@ -661,6 +667,113 @@ function parseCommand(cmd) {
   return tokens;
 }
 
+function isSearchResourceLimitError(err) {
+  const message = String(err?.message || '');
+  return err?.code === 'ETIMEDOUT'
+    || err?.code === 'ENOBUFS'
+    || message.includes('maxBuffer')
+    || message.includes('timed out');
+}
+
+function formatSearchResourceLimitMessage() {
+  return 'Search was too broad and hit local resource limits. Narrow the pattern or provide a glob like "**/*.ts". Prefer glob for filename discovery before content search.';
+}
+
+function sanitizeSearchPaths(rawOutput, safePath) {
+  return String(rawOutput || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => {
+      try {
+        safePath(line);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+}
+
+function sanitizeSearchMatches(rawOutput, safePath) {
+  return String(rawOutput || '')
+    .split('\n')
+    .filter(Boolean)
+    .filter((line) => {
+      const filePath = line.split(':', 1)[0];
+      try {
+        safePath(filePath);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+}
+
+function formatSearchMatches(lines, totalMatchingFiles) {
+  if (lines.length === 0) {
+    return 'No matches found.';
+  }
+  const truncatedLines = lines.length > SEARCH_LINE_LIMIT;
+  const limitedLines = lines.slice(0, SEARCH_LINE_LIMIT);
+  let suffix = '';
+  if (totalMatchingFiles > SEARCH_FILE_LIMIT) {
+    suffix += `\n... (${totalMatchingFiles - SEARCH_FILE_LIMIT} more matching files; narrow the glob or pattern to continue)`;
+  }
+  if (truncatedLines) {
+    suffix += `\n... (truncated to ${SEARCH_LINE_LIMIT} matching lines)`;
+  }
+  return limitedLines.join('\n') + suffix;
+}
+
+function runSearchCommand(program, commandArgs, projectDir) {
+  return execFileSync(program, commandArgs, {
+    cwd: projectDir,
+    encoding: 'utf8',
+    maxBuffer: SEARCH_MAX_BUFFER,
+    timeout: SEARCH_TIMEOUT_MS,
+  });
+}
+
+function searchWithRipgrep(pattern, globPattern, projectDir, safePath) {
+  const listArgs = ['-l', '--color', 'never', '--no-messages'];
+  if (globPattern) {
+    listArgs.push('--glob', globPattern);
+  }
+  listArgs.push(pattern, '.');
+
+  const fileListOutput = runSearchCommand('rg', listArgs, projectDir);
+  const matchingFiles = sanitizeSearchPaths(fileListOutput, safePath);
+  if (matchingFiles.length === 0) {
+    return 'No matches found.';
+  }
+
+  const filesToInspect = matchingFiles.slice(0, SEARCH_FILE_LIMIT);
+  const matchArgs = ['-n', '--color', 'never', '--no-heading', '-m', String(SEARCH_LINES_PER_FILE), pattern, ...filesToInspect];
+  const matchesOutput = runSearchCommand('rg', matchArgs, projectDir);
+  const lines = sanitizeSearchMatches(matchesOutput, safePath);
+  return formatSearchMatches(lines, matchingFiles.length);
+}
+
+function searchWithGrep(pattern, globPattern, projectDir, safePath) {
+  const listArgs = ['-rl'];
+  if (globPattern) {
+    listArgs.push(`--include=${globPattern}`);
+  }
+  listArgs.push(pattern, '.');
+
+  const fileListOutput = runSearchCommand('grep', listArgs, projectDir);
+  const matchingFiles = sanitizeSearchPaths(fileListOutput, safePath);
+  if (matchingFiles.length === 0) {
+    return 'No matches found.';
+  }
+
+  const filesToInspect = matchingFiles.slice(0, SEARCH_FILE_LIMIT);
+  const matchArgs = ['-rn', '-m', String(SEARCH_LINES_PER_FILE), pattern, ...filesToInspect];
+  const matchesOutput = runSearchCommand('grep', matchArgs, projectDir);
+  const lines = sanitizeSearchMatches(matchesOutput, safePath);
+  return formatSearchMatches(lines, matchingFiles.length);
+}
+
 async function executeTool(name, args, projectDir, context) {
   const safePath = createSafePath(
     projectDir,
@@ -689,28 +802,25 @@ async function executeTool(name, args, projectDir, context) {
       return `Wrote ${args.content.length} bytes to ${args.path}`;
     }
     case 'search_files': {
-      const globPattern = args.glob || '*';
+      const globPattern = String(args.glob || '').trim();
       try {
-        const result = execFileSync(
-          'grep',
-          ['-rn', `--include=${globPattern}`, args.pattern, '.'],
-          { cwd: projectDir, encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10000 },
-        );
-        const lines = result
-          .split('\n')
-          .filter(Boolean)
-          .filter((line) => {
-            const filePath = line.split(':', 1)[0];
-            try {
-              safePath(filePath);
-              return true;
-            } catch {
-              return false;
-            }
-          });
-        const isTruncated = lines.length > 50;
-        return lines.slice(0, 50).join('\n') + (isTruncated ? '\n... (truncated)' : '');
+        return searchWithRipgrep(args.pattern, globPattern, projectDir, safePath);
       } catch (err) {
+        if (err.status === 1) return 'No matches found.';
+        if (err.code === 'ENOENT') {
+          try {
+            return searchWithGrep(args.pattern, globPattern, projectDir, safePath);
+          } catch (fallbackErr) {
+            if (fallbackErr.status === 1) return 'No matches found.';
+            if (isSearchResourceLimitError(fallbackErr)) {
+              return formatSearchResourceLimitMessage();
+            }
+            return `Search error: ${fallbackErr.message}`;
+          }
+        }
+        if (isSearchResourceLimitError(err)) {
+          return formatSearchResourceLimitMessage();
+        }
         if (err.status === 1) return 'No matches found.';
         return `Search error: ${err.message}`;
       }
@@ -990,14 +1100,18 @@ const geminiProvider = {
     const safeMode = input.providerConfig?.SAFE_MODE !== 'false';
     const permissionTier = getPermissionTier(input.policy, safeMode);
 
-    let defaultPrompt;
+    let workspaceGuidance;
     if (allowedRoots.length > 1) {
       const dirList = allowedRoots.map((r) => `  - ${r}`).join('\n');
-      defaultPrompt = `You are a coding assistant with access to multiple project directories:\n${dirList}\n\nYour primary working directory is: ${projectDir}\nRelative paths resolve against the primary directory. Use absolute paths to access other directories.\nOperate only within the allowed directories and never use blocked paths.\nYour current permission tier is: ${permissionTier}.\nIn dev-safe mode, you may edit files within the workspace and run only safe local development commands. In read-only mode, do not attempt writes or shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nKeep responses concise and focused on the task.`;
+      workspaceGuidance = `You are a coding assistant with access to multiple project directories:\n${dirList}\n\nYour primary working directory is: ${projectDir}\nRelative paths resolve against the primary directory. Use absolute paths to access other directories.`;
     } else {
-      defaultPrompt = `You are a coding assistant with access to a project directory at: ${projectDir}\n\nOperate only within the allowed directories and never use blocked paths.\nYour current permission tier is: ${permissionTier}.\nIn dev-safe mode, you may edit files within the workspace and run only safe local development commands. In read-only mode, do not attempt writes or shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nKeep responses concise and focused on the task.`;
+      workspaceGuidance = `You are a coding assistant with access to a project directory at: ${projectDir}`;
     }
-    const systemPrompt = input.systemPrompt || defaultPrompt;
+    const toolGuidance = `Operate only within the allowed directories and never use blocked paths.\nYour current permission tier is: ${permissionTier}.\nIn dev-safe mode, you may edit files within the workspace and run only safe local development commands. In read-only mode, do not attempt writes or shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nPrefer glob for filename discovery and use search_files only when you need content matches. For large repos, narrow search_files with a glob like "**/*.ts" or a more specific pattern.\nKeep responses concise and focused on the task.`;
+    const defaultPrompt = `${workspaceGuidance}\n\n${toolGuidance}`;
+    const systemPrompt = input.systemPrompt
+      ? `${input.systemPrompt}\n\nAdditional runtime guidance:\n${workspaceGuidance}\n${toolGuidance}`
+      : defaultPrompt;
 
     const projectId = await getProjectId(auth);
 
