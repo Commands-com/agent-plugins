@@ -309,4 +309,5 @@ GETTING_STARTED.md       Step-by-step setup guide
 ## Additional Docs
 
 - [Getting Started](./GETTING_STARTED.md)
+- [Contributing](./CONTRIBUTING.md)
 - [Provider Contract](./docs/CONTRACT.md)
