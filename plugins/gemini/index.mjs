@@ -630,6 +630,8 @@ const SEARCH_MAX_BUFFER = 8 * 1024 * 1024;
 const SEARCH_FILE_LIMIT = 40;
 const SEARCH_LINES_PER_FILE = 3;
 const SEARCH_LINE_LIMIT = 120;
+const SAFE_COMMAND_LINE_LIMIT = 800;
+const FULL_COMMAND_LINE_LIMIT = 2000;
 
 function isCommandAllowed(cmd) {
   const trimmed = cmd.trim();
@@ -638,6 +640,22 @@ function isCommandAllowed(cmd) {
     if (trimmed.startsWith(prefix + ' ')) return true;
     return false;
   });
+}
+
+function formatTruncatedCommandOutput(command, lines, maxLines) {
+  const visible = lines.slice(0, maxLines).join('\n');
+  const trimmed = String(command || '').trim();
+  let hint = 'Output was truncated. Narrow the command and continue instead of stopping.';
+
+  if (trimmed.startsWith('git diff')) {
+    hint = 'Output was truncated. For reviews, continue with narrower commands such as `git diff --name-only <range>`, then `git diff <range> -- <file>` for each changed file.';
+  } else if (trimmed.startsWith('git show')) {
+    hint = 'Output was truncated. Continue with narrower commands such as `git show --stat <commit>` or `git show <commit> -- <file>` for the most relevant files.';
+  } else if (trimmed.startsWith('git log')) {
+    hint = 'Output was truncated. Continue with narrower commands such as `git log --oneline <range>` or `git log --stat -- <file>`.';
+  }
+
+  return `${visible}\n... (truncated)\n${hint}`;
 }
 
 function parseCommand(cmd) {
@@ -901,8 +919,8 @@ Task: ${args.request}`;
               timeout: 30000,
             });
             const lines = result.split('\n');
-            if (lines.length > 100) {
-              return lines.slice(0, 100).join('\n') + '\n... (truncated)';
+            if (lines.length > SAFE_COMMAND_LINE_LIMIT) {
+              return formatTruncatedCommandOutput(command, lines, SAFE_COMMAND_LINE_LIMIT);
             }
             return result || '(no output)';
           } catch (err) {
@@ -921,8 +939,8 @@ Task: ${args.request}`;
                   shell: true
               });
               const lines = result.split('\n');
-              if (lines.length > 200) {
-                  return lines.slice(0, 200).join('\n') + '\n... (truncated)';
+              if (lines.length > FULL_COMMAND_LINE_LIMIT) {
+                  return formatTruncatedCommandOutput(command, lines, FULL_COMMAND_LINE_LIMIT);
               }
               return result || '(no output)';
           } catch (err) {
@@ -1107,7 +1125,7 @@ const geminiProvider = {
     } else {
       workspaceGuidance = `You are a coding assistant with access to a project directory at: ${projectDir}`;
     }
-    const toolGuidance = `Operate only within the allowed directories and never use blocked paths.\nYour current permission tier is: ${permissionTier}.\nIn dev-safe mode, you may edit files within the workspace and run only safe local development commands. In read-only mode, do not attempt writes or shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nPrefer glob for filename discovery and use search_files only when you need content matches. For large repos, narrow search_files with a glob like "**/*.ts" or a more specific pattern.\nKeep responses concise and focused on the task.`;
+    const toolGuidance = `Operate only within the allowed directories and never use blocked paths.\nYour current permission tier is: ${permissionTier}.\nIn dev-safe mode, you may edit files within the workspace and run only safe local development commands. In read-only mode, do not attempt writes or shell commands.\nAlways explore the project structure before making changes.\nWhen editing files, read them first to understand the context.\nPrefer glob for filename discovery and use search_files only when you need content matches. For large repos, narrow search_files with a glob like "**/*.ts" or a more specific pattern.\nWhen reviewing a commit range, do not rely on one huge \`git diff\`. Start with \`git diff --name-only <range>\` or \`git show --stat <commit>\`, then inspect the most relevant files incrementally.\nIf a command or search returns truncated output, treat that as a cue to narrow the scope and continue with follow-up commands instead of stopping.\nKeep responses concise and focused on the task.`;
     const defaultPrompt = `${workspaceGuidance}\n\n${toolGuidance}`;
     const systemPrompt = input.systemPrompt
       ? `${input.systemPrompt}\n\nAdditional runtime guidance:\n${workspaceGuidance}\n${toolGuidance}`
