@@ -367,15 +367,12 @@ const RETRYABLE_NETWORK_CODES = [
 ];
 
 function isRetryableError(error) {
-  const msg = (error.message || '').toLowerCase();
+  const msg = extractErrorSignalText(error).toLowerCase();
   if (msg.includes('fetch failed') || msg.includes('premature close')) return true;
 
   if (error.code && RETRYABLE_NETWORK_CODES.includes(error.code)) return true;
 
-  let status = error.status;
-  if (!status && error.response && error.response.status) {
-    status = error.response.status;
-  }
+  const status = getErrorStatus(error);
 
   if (status) {
     // Retry on 429 (Too Many Requests), 499 (Client Closed Request), and 5xx (Server Errors)
@@ -385,6 +382,48 @@ function isRetryableError(error) {
   }
 
   return false;
+}
+
+function getErrorStatus(error) {
+  return error?.status
+    || error?.response?.status
+    || error?.response?.data?.error?.code
+    || null;
+}
+
+function extractErrorSignalText(error) {
+  const parts = [];
+  if (error?.message) parts.push(String(error.message));
+
+  const apiError = error?.response?.data?.error || error?.data?.error || null;
+  if (apiError) {
+    if (apiError.message) parts.push(String(apiError.message));
+    if (apiError.status) parts.push(String(apiError.status));
+    if (Array.isArray(apiError.errors)) {
+      for (const item of apiError.errors) {
+        if (item?.message) parts.push(String(item.message));
+        if (item?.reason) parts.push(String(item.reason));
+      }
+    }
+    if (Array.isArray(apiError.details)) {
+      for (const detail of apiError.details) {
+        if (detail?.reason) parts.push(String(detail.reason));
+        if (detail?.domain) parts.push(String(detail.domain));
+        if (detail?.metadata?.model) parts.push(String(detail.metadata.model));
+      }
+    }
+  }
+
+  return parts.join(' | ');
+}
+
+function isCapacityExhaustedError(error) {
+  const msg = extractErrorSignalText(error).toLowerCase();
+  return msg.includes('model_capacity_exhausted')
+    || msg.includes('no capacity available for model')
+    || msg.includes('resource_exhausted')
+    || msg.includes('exhausted your capacity')
+    || msg.includes('quota exceeded');
 }
 
 async function generateContentWithRetry(auth, initialModel, requestBodyBase) {
@@ -413,7 +452,7 @@ async function generateContentWithRetry(auth, initialModel, requestBodyBase) {
       const response = await apiStreamPost(auth, 'streamGenerateContent', requestBody);
       return { response, model };
     } catch (error) {
-      const msg = (error.message || '').toLowerCase();
+      const msg = extractErrorSignalText(error).toLowerCase();
       
       // 1. Handle explicit server wait times
       const resetMatch = msg.match(/reset after (\d+)s/);
@@ -421,11 +460,11 @@ async function generateContentWithRetry(auth, initialModel, requestBodyBase) {
          error.isExhausted = true; 
       }
 
-      // 2. Handle Terminal Quota / Exhaustion with Model Fallbacks
-      const isExhausted = error.isExhausted || msg.includes('exhausted your capacity') || msg.includes('quota exceeded');
+      // 2. Handle model-capacity / quota exhaustion with model fallbacks
+      const isExhausted = error.isExhausted || isCapacityExhaustedError(error);
       if (isExhausted) {
         if (fallbacks[model]) {
-          logDebug(`Capacity exhausted for ${model}, falling back to ${fallbacks[model]}.`);
+          logDebug(`Capacity exhausted for ${model}, falling back to ${fallbacks[model]}. Signal: ${extractErrorSignalText(error)}`);
           model = fallbacks[model];
           attempt = 0; // Reset attempts for the new model
           currentDelay = initialDelayMs;
@@ -441,7 +480,7 @@ async function generateContentWithRetry(auth, initialModel, requestBodyBase) {
         const jitter = currentDelay * 0.3 * (Math.random() * 2 - 1);
         const delayWithJitter = Math.max(0, currentDelay + jitter);
         
-        logDebug(`Attempt ${attempt} failed for ${model}: ${error.message}. Retrying in ${Math.round(delayWithJitter)}ms...`);
+        logDebug(`Attempt ${attempt} failed for ${model}: ${extractErrorSignalText(error)}. Retrying in ${Math.round(delayWithJitter)}ms...`);
         
         await delay(delayWithJitter);
         currentDelay = Math.min(maxDelayMs, currentDelay * 2);
