@@ -928,7 +928,7 @@ Task: ${args.request}`;
            model: context.model,
            systemPrompt: sysPrompt,
            initialMessage: args.request,
-           maxTurns: 50,
+           maxTurns: 500,
            projectDir,
            safeMode: context.safeMode,
            allowedRoots: context.allowedRoots,
@@ -1032,6 +1032,7 @@ async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessa
 
     let turns = 0;
     let finalText = '';
+    let lastToolNames = [];
 
     while (turns < maxTurns) {
       turns++;
@@ -1081,6 +1082,8 @@ async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessa
         break;
       }
 
+      lastToolNames = functionCalls.map((fc) => fc.name).filter(Boolean);
+
       const functionResponseParts = [];
       for (const fc of functionCalls) {
         let result;
@@ -1104,7 +1107,9 @@ async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessa
       });
 
       if (turns >= maxTurns) {
-        finalText = text || '(max tool rounds reached)';
+        const toolSummary = lastToolNames.length > 0 ? lastToolNames.join(', ') : 'none';
+        const limitMessage = `Max tool rounds reached after ${turns}/${maxTurns} turns. Last tool calls: ${toolSummary}. Gemini kept requesting tools without producing a final answer.`;
+        finalText = text ? `${text}\n\n${limitMessage}` : limitMessage;
       }
     }
 
