@@ -14,6 +14,29 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, execSync } from 'node:child_process';
 import { OAuth2Client } from 'google-auth-library';
+
+function emitProgress(cb, event) {
+  if (typeof cb !== 'function') return;
+  try {
+    cb(event);
+  } catch {}
+}
+
+function summarizeProgressDetail(value, maxLength = 200) {
+  if (typeof value === 'string') {
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+    return normalized.length > maxLength
+      ? `${normalized.slice(0, maxLength - 1)}…`
+      : normalized;
+  }
+  if (value && typeof value === 'object') {
+    try {
+      return summarizeProgressDetail(JSON.stringify(value), maxLength);
+    } catch {}
+  }
+  return '';
+}
 import readline from 'node:readline';
 import { Readable } from 'node:stream';
 import { validatePathArgsWithinProject } from './path-guard.mjs';
@@ -258,7 +281,7 @@ async function apiPost(auth, method, body, signal) {
 }
 
 // For streaming calls (keeps socket alive) matching CLI behavior
-async function apiStreamPost(auth, method, body, signal) {
+async function apiStreamPost(auth, method, body, signal, onProgress) {
   const url = getMethodUrl(method);
   let responseStream;
 
@@ -321,6 +344,21 @@ async function apiStreamPost(auth, method, body, signal) {
 
       for (const part of parts) {
         if (part.text !== undefined) {
+          const textDelta = typeof part.text === 'string' ? part.text : '';
+          if (textDelta) {
+            if (part.thought) {
+              emitProgress(onProgress, {
+                type: 'activity',
+                activity: {
+                  kind: 'thinking',
+                  label: 'Gemini thinking',
+                  detail: summarizeProgressDetail(textDelta) || undefined,
+                },
+              });
+            } else {
+              emitProgress(onProgress, { type: 'delta', delta: textDelta });
+            }
+          }
           const lastPart = targetParts[targetParts.length - 1];
           if (lastPart && lastPart.text !== undefined && !!lastPart.thought === !!part.thought) {
             lastPart.text += part.text;
@@ -330,6 +368,16 @@ async function apiStreamPost(auth, method, body, signal) {
             targetParts.push(newPart);
           }
         } else if (part.functionCall) {
+          emitProgress(onProgress, {
+            type: 'activity',
+            activity: {
+              kind: 'tool_use',
+              label: typeof part.functionCall?.name === 'string' && part.functionCall.name.trim()
+                ? part.functionCall.name.trim()
+                : 'Tool use',
+              detail: summarizeProgressDetail(part.functionCall?.args || part.functionCall) || undefined,
+            },
+          });
           // Carry over the thoughtSignature natively if it exists
           const functionCallObj = { functionCall: part.functionCall };
           if (part.thoughtSignature) {
@@ -426,7 +474,7 @@ function isCapacityExhaustedError(error) {
     || msg.includes('quota exceeded');
 }
 
-async function generateContentWithRetry(auth, initialModel, requestBodyBase) {
+async function generateContentWithRetry(auth, initialModel, requestBodyBase, onProgress) {
   let model = initialModel;
   const maxAttempts = 10;
   let attempt = 0;
@@ -449,7 +497,7 @@ async function generateContentWithRetry(auth, initialModel, requestBodyBase) {
 
     try {
       // Use the streaming endpoint which keeps sockets alive for long tool execution
-      const response = await apiStreamPost(auth, 'streamGenerateContent', requestBody);
+      const response = await apiStreamPost(auth, 'streamGenerateContent', requestBody, undefined, onProgress);
       return { response, model };
     } catch (error) {
       const msg = extractErrorSignalText(error).toLowerCase();
@@ -465,6 +513,14 @@ async function generateContentWithRetry(auth, initialModel, requestBodyBase) {
       if (isExhausted) {
         if (fallbacks[model]) {
           logDebug(`Capacity exhausted for ${model}, falling back to ${fallbacks[model]}. Signal: ${extractErrorSignalText(error)}`);
+          emitProgress(onProgress, {
+            type: 'activity',
+            activity: {
+              kind: 'system',
+              label: 'Gemini model fallback',
+              detail: `${model} -> ${fallbacks[model]}`,
+            },
+          });
           model = fallbacks[model];
           attempt = 0; // Reset attempts for the new model
           currentDelay = initialDelayMs;
@@ -481,6 +537,14 @@ async function generateContentWithRetry(auth, initialModel, requestBodyBase) {
         const delayWithJitter = Math.max(0, currentDelay + jitter);
         
         logDebug(`Attempt ${attempt} failed for ${model}: ${extractErrorSignalText(error)}. Retrying in ${Math.round(delayWithJitter)}ms...`);
+        emitProgress(onProgress, {
+          type: 'activity',
+          activity: {
+            kind: 'system',
+            label: 'Gemini retrying request',
+            detail: summarizeProgressDetail(extractErrorSignalText(error)) || undefined,
+          },
+        });
         
         await delay(delayWithJitter);
         currentDelay = Math.min(maxDelayMs, currentDelay * 2);
@@ -1020,7 +1084,7 @@ function extractResponseParts(response) {
 // ProviderPlugin export
 // ---------------------------------------------------------------------------
 
-async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessage, maxTurns, projectDir, safeMode, resumeSessionId, allowedRoots, blockedRoots, policy, permissionTier }) {
+async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessage, maxTurns, projectDir, safeMode, resumeSessionId, allowedRoots, blockedRoots, policy, permissionTier, onProgress }) {
     const { session, id: sessionId } = getOrCreateSession(resumeSessionId);
 
     if (initialMessage) {
@@ -1033,6 +1097,15 @@ async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessa
     let turns = 0;
     let finalText = '';
     let lastToolNames = [];
+
+    emitProgress(onProgress, {
+      type: 'activity',
+      activity: {
+        kind: 'system',
+        label: 'Gemini session ready',
+        detail: sessionId,
+      },
+    });
 
     while (turns < maxTurns) {
       turns++;
@@ -1055,11 +1128,19 @@ async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessa
 
       let response;
       try {
-        const result = await generateContentWithRetry(auth, model, requestBodyBase);
+        const result = await generateContentWithRetry(auth, model, requestBodyBase, onProgress);
         response = result.response;
         model = result.model;
       } catch (err) {
         logDebug(`Gemini API error after all retries: ${err.message}\n\n---\n\n`);
+        emitProgress(onProgress, {
+          type: 'activity',
+          activity: {
+            kind: 'system',
+            label: 'Gemini error',
+            detail: summarizeProgressDetail(err.message) || undefined,
+          },
+        });
         return {
           result: `Error calling Gemini API: ${err.message}`,
           turns,
@@ -1093,6 +1174,14 @@ async function runAgentLoop({ auth, projectId, model, systemPrompt, initialMessa
         } catch (err) {
           result = `Tool error: ${err.message}`;
         }
+        emitProgress(onProgress, {
+          type: 'activity',
+          activity: {
+            kind: 'tool_result',
+            label: typeof fc.name === 'string' && fc.name.trim() ? `${fc.name.trim()} completed` : 'Tool result',
+            detail: summarizeProgressDetail(result) || undefined,
+          },
+        });
         functionResponseParts.push({
           functionResponse: {
             name: fc.name,
@@ -1190,7 +1279,8 @@ const geminiProvider = {
       blockedRoots,
       permissionTier,
       policy: input.policy,
-      resumeSessionId: input.resumeSessionId
+      resumeSessionId: input.resumeSessionId,
+      onProgress: input.onProgress,
     });
 
     return result;
